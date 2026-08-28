@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: meteo-ensemble-telegram-bot
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: ""
+    startCommand: "python meteo_telegram_bot.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: KEEP_ALIVE_INTERVAL
+        value: "540"
