@@ -16,7 +16,7 @@ import threading
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Union
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -31,7 +31,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # CONFIGURAZIONE E COSTANTI
 # ==============================================================================
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
-CACHE_TTL_SECONDS = 300  # 5 minuti di cache per chiamate meteo
+CACHE_TTL_SECONDS = 300  # 5 minuti di cache per previsioni generali
 HTTP_TIMEOUT = 25
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 1.0
@@ -190,12 +190,12 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
         f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability"
         f"&models={models_query}"
         f"&forecast_days={forecast_days}"
-        f"&timezone=auto"
+        f"&timezone=Europe%2FRome"
     )
 
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Meteo-Telegram-Bot/2.0"}
+        headers={"User-Agent": "Meteo-Telegram-Bot/2.1"}
     )
     for attempt in range(MAX_RETRIES):
         try:
@@ -264,7 +264,7 @@ def extract_city_metrics(data: dict) -> dict:
 
 
 def parse_location_forecast(loc_key: str, force_refresh: bool = False, days: int = 3) -> Dict[str, Any]:
-    """Ottiene i dati meteo con cache in memoria per una località."""
+    """Ottiene i dati meteo con fuso orario italiano calcolato con precisione."""
     loc_info = LOCATIONS.get(loc_key)
     if not loc_info:
         raise ValueError(f"Località '{loc_key}' non supportata.")
@@ -277,6 +277,11 @@ def parse_location_forecast(loc_key: str, force_refresh: bool = False, days: int
 
     raw_data = fetch_weather_data(lat=loc_info["lat"], lon=loc_info["lon"], forecast_days=days)
     metrics = extract_city_metrics(raw_data)
+
+    # Calcolo esatto dell'orario locale italiano (indipendentemente dal server cloud che gira in UTC)
+    offset_seconds = raw_data.get("utc_offset_seconds", 7200)
+    utc_now = datetime.now(timezone.utc)
+    local_now = (utc_now + timedelta(seconds=offset_seconds)).replace(tzinfo=None)
 
     hourly = raw_data.get("hourly", {})
     times = hourly.get("time", [])
@@ -386,7 +391,8 @@ def parse_location_forecast(loc_key: str, force_refresh: bool = False, days: int
         "metrics": metrics,
         "daily": daily_stats,
         "hours": hours_list,
-        "updated_at": datetime.now().strftime("%d/%m/%Y alle %H:%M:%S")
+        "local_now": local_now,
+        "updated_at": local_now.strftime("%d/%m/%Y alle %H:%M:%S")
     }
 
     cache_store.set(cache_key, result_data)
@@ -400,14 +406,14 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     """Formatta la scheda per le condizioni meteorologiche in tempo reale (Adesso)."""
     loc = data["loc"]
     hours = data.get("hours", [])
+    local_now = data.get("local_now", datetime.now())
     updated_at = data.get("updated_at", "")
 
     if not hours:
         return f"⚠️ Dati meteo non disponibili per {loc['name']}."
 
-    # Trova lo slot orario più vicino all'ora locale corrente
-    now_local = datetime.now()
-    closest_slot = min(hours, key=lambda h: abs((h["dt"].replace(tzinfo=None) - now_local.replace(tzinfo=None)).total_seconds()))
+    # Trova lo slot orario corrispondente all'orario locale italiano calcolato
+    closest_slot = min(hours, key=lambda h: abs((h["dt"] - local_now).total_seconds()))
     
     cur_t = closest_slot["temp"]
     cur_wb = closest_slot["wet_bulb"]
@@ -446,7 +452,7 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     out = [
         "🌡️ <b>METEO IN TEMPO REALE</b>",
         f"🏙️ <b>{loc['name'].upper()}</b> (<i>{loc['region']}</i>)",
-        f"⏱️ <i>Fascia oraria di riferimento: {closest_slot['day']} ore {closest_slot['hour']}</i>",
+        f"⏱️ <i>Fascia oraria attiva: {closest_slot['day']} ore {closest_slot['hour']}</i>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"{cur_icon} <b>Condizione:</b> {cur_label}",
         f"🌡️ <b>Temperatura Live:</b> <code>{cur_t:.1f}°C</code> (Media 5 Modelli)",
@@ -775,17 +781,17 @@ class WeatherBotRunner:
 
         elif text in ("/adesso", "adesso", "/ora", "ora", "/live", "live", "/temperatura"):
             self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, city, "now")
+            self.send_view(chat_id, city, "now", force_refresh=True)
 
         elif text in ("/adesso_putignano", "adesso putignano", "/ora_putignano"):
             self.user_current_city[chat_id] = "putignano"
             self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, "putignano", "now")
+            self.send_view(chat_id, "putignano", "now", force_refresh=True)
 
         elif text in ("/adesso_monza", "adesso monza", "/ora_monza"):
             self.user_current_city[chat_id] = "monza"
             self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, "monza", "now")
+            self.send_view(chat_id, "monza", "now", force_refresh=True)
 
         elif text in ("/putignano", "putignano"):
             self.user_current_city[chat_id] = "putignano"
@@ -869,9 +875,11 @@ class WeatherBotRunner:
             parts = data.replace("tab_", "").split("_")
             cur_city = parts[0]
             cur_tab = parts[1]
+            if cur_tab == "now":
+                force_refresh = True
             self.user_current_city[chat_id] = cur_city
             self.user_current_tab[chat_id] = cur_tab
-            self.client.answer_callback_query(cb_id, text=f"Caricamento scheda {cur_tab}...")
+            self.client.answer_callback_query(cb_id, text=f"Caricamento {cur_tab.capitalize()}...")
 
         elif data.startswith("refresh_"):
             parts = data.replace("refresh_", "").split("_")
@@ -904,10 +912,10 @@ class WeatherBotRunner:
         else:
             return format_city_weather_message(data, only_rain=only_rain)
 
-    def send_view(self, chat_id: int, city: str, tab: str) -> None:
+    def send_view(self, chat_id: int, city: str, tab: str, force_refresh: bool = False) -> None:
         try:
             only_rain = self.user_rain_mode.get(chat_id, False)
-            text = self.get_content_for_view(city, tab, only_rain=only_rain, force_refresh=False)
+            text = self.get_content_for_view(city, tab, only_rain=only_rain, force_refresh=force_refresh)
             self.client.send_message(chat_id, text, reply_markup=get_inline_keyboard(city, tab, only_rain))
         except Exception as e:
             self.client.send_message(
