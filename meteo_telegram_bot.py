@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Meteo Multi-Modello (Putignano & Monza) - Standalone Telegram Bot (Zero External Dependencies)
-Bot Telegram completo per previsioni meteo ed ensemble di 5 modelli internazionali.
+Meteo Multi-Modello (Ensemble 5 Modelli) - Standalone Telegram Bot (Zero External Dependencies)
+Bot Telegram completo per previsioni meteo, geocoding globale, coordinate GPS e monitor allerta pioggia multi-punto.
 Utilizza esclusivamente la libreria standard Python (urllib, json, threading, http.server)
 ed è ottimizzato per l'esecuzione locale e il deploy gratuito 24/7 su Cloud (Render, Railway, Koyeb).
 """
 
 import sys
 import os
+import re
 import math
 import json
 import time
@@ -36,8 +37,8 @@ HTTP_TIMEOUT = 25
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 1.0
 
-# Località geografiche supportate
-LOCATIONS = {
+# Località geografiche predefinite
+DEFAULT_LOCATIONS = {
     "putignano": {
         "key": "putignano",
         "name": "Putignano (BA)",
@@ -142,6 +143,73 @@ class CacheManager:
 cache_store = CacheManager()
 
 # ==============================================================================
+# GEOCODING E PARSING COORDINATE (100% GRATUITO)
+# ==============================================================================
+def geocode_city(query_name: str) -> Optional[Dict[str, Any]]:
+    """Interroga l'API Open-Meteo Geocoding per trovare le coordinate di una città."""
+    clean_q = query_name.strip()
+    if not clean_q:
+        return None
+
+    # Controllo cache
+    cache_key = f"geo_{clean_q.lower()}"
+    cached = cache_store.get(cache_key)
+    if cached:
+        return cached
+
+    url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(clean_q)}&count=1&language=it&format=json"
+    req = urllib.request.Request(url, headers={"User-Agent": "Meteo-Telegram-Bot/3.0"})
+    
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                results = data.get("results", [])
+                if results:
+                    top = results[0]
+                    name = top.get("name", clean_q.capitalize())
+                    country = top.get("country", "")
+                    admin1 = top.get("admin1", "")
+                    region_str = f"{admin1} ({country})" if admin1 and country else country or "Italia"
+                    
+                    loc_dict = {
+                        "key": f"geo_{top.get('id', int(top.get('latitude', 0)*100))}",
+                        "name": f"{name} ({top.get('country_code', 'IT')})",
+                        "lat": float(top.get("latitude")),
+                        "lon": float(top.get("longitude")),
+                        "region": region_str,
+                        "desc": f"Coordinate: {top.get('latitude'):.4f}°N, {top.get('longitude'):.4f}°E ({region_str})"
+                    }
+                    cache_store.set(cache_key, loc_dict)
+                    return loc_dict
+    except Exception as e:
+        print(f"[!] Errore Geocoding per '{clean_q}': {e}", file=sys.stderr)
+    return None
+
+
+def parse_coordinates_text(text: str) -> Optional[Dict[str, Any]]:
+    """Estrae coordinate geografiche (latitudine, longitudine) da una stringa testuale."""
+    # Pattern: 40.8505, 17.1235 oppure 40.8505 17.1235
+    match = re.search(r'([-+]?\d{1,2}(?:\.\d+)?)[,\s]+([-+]?\d{1,3}(?:\.\d+)?)', text.strip())
+    if match:
+        try:
+            lat = float(match.group(1))
+            lon = float(match.group(2))
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return {
+                    "key": f"coord_{lat:.4f}_{lon:.4f}",
+                    "name": f"Coord ({lat:.3f}°N, {lon:.3f}°E)",
+                    "lat": lat,
+                    "lon": lon,
+                    "region": "Punto GPS Personalizzato",
+                    "desc": f"Coordinate GPS: {lat:.4f}°N, {lon:.4f}°E"
+                }
+        except Exception:
+            pass
+    return None
+
+
+# ==============================================================================
 # CALCOLI METEOROLOGICI ED ENSEMBLE
 # ==============================================================================
 def calculate_wet_bulb(temp_c: float, rh_pct: float) -> float:
@@ -190,12 +258,12 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
         f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability"
         f"&models={models_query}"
         f"&forecast_days={forecast_days}"
-        f"&timezone=Europe%2FRome"
+        f"&timezone=auto"
     )
 
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Meteo-Telegram-Bot/2.1"}
+        headers={"User-Agent": "Meteo-Telegram-Bot/3.0"}
     )
     for attempt in range(MAX_RETRIES):
         try:
@@ -263,13 +331,30 @@ def extract_city_metrics(data: dict) -> dict:
     }
 
 
-def parse_location_forecast(loc_key: str, force_refresh: bool = False, days: int = 3) -> Dict[str, Any]:
-    """Ottiene i dati meteo con fuso orario italiano calcolato con precisione."""
-    loc_info = LOCATIONS.get(loc_key)
-    if not loc_info:
-        raise ValueError(f"Località '{loc_key}' non supportata.")
+def resolve_location(target: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Risolve un target in un dizionario di località valido (stringa chiave predefinita o dict)."""
+    if isinstance(target, dict) and "lat" in target and "lon" in target:
+        return target
+    if isinstance(target, str):
+        low = target.lower().strip()
+        if low in DEFAULT_LOCATIONS:
+            return DEFAULT_LOCATIONS[low]
+        # Prova parsing coordinate
+        parsed_coord = parse_coordinates_text(target)
+        if parsed_coord:
+            return parsed_coord
+        # Prova geocoding
+        geocoded = geocode_city(target)
+        if geocoded:
+            return geocoded
+    return DEFAULT_LOCATIONS["putignano"]
 
-    cache_key = f"meteo_{loc_key}_{days}"
+
+def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: bool = False, days: int = 3) -> Dict[str, Any]:
+    """Ottiene i dati meteo per una località (predefinita o dinamica) con fuso orario locale esatto."""
+    loc_info = resolve_location(target)
+
+    cache_key = f"meteo_{loc_info['lat']:.4f}_{loc_info['lon']:.4f}_{days}"
     if not force_refresh:
         cached = cache_store.get(cache_key)
         if cached:
@@ -412,7 +497,6 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     if not hours:
         return f"⚠️ Dati meteo non disponibili per {loc['name']}."
 
-    # Trova lo slot orario corrispondente all'orario locale italiano calcolato
     closest_slot = min(hours, key=lambda h: abs((h["dt"] - local_now).total_seconds()))
     
     cur_t = closest_slot["temp"]
@@ -437,7 +521,7 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     else:
         stress_badge = "🔴 PERICOLO / Afa estrema"
 
-    # Dettaglio modelli per la temperatura attuale
+    # Dettaglio modelli
     m_temps = closest_slot.get("model_temps", {})
     m_temp_str = " • ".join([f"{MODELS[k]}: <code>{m_temps[k]:.1f}°C</code>" for k in MODELS.keys() if k in m_temps])
 
@@ -451,7 +535,8 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
 
     out = [
         "🌡️ <b>METEO IN TEMPO REALE</b>",
-        f"🏙️ <b>{loc['name'].upper()}</b> (<i>{loc['region']}</i>)",
+        f"🏙️ <b>{loc['name'].upper()}</b>",
+        f"📍 <i>{loc.get('desc', loc.get('region', ''))}</i>",
         f"⏱️ <i>Fascia oraria attiva: {closest_slot['day']} ore {closest_slot['hour']}</i>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"{cur_icon} <b>Condizione:</b> {cur_label}",
@@ -478,7 +563,8 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
 
     header = [
         f"📍 <b>PREVISIONI METEO ENSEMBLE (3 GIORNI)</b>",
-        f"🏙️ <b>{loc['name'].upper()}</b> (<i>{loc['region']}</i>)",
+        f"🏙️ <b>{loc['name'].upper()}</b>",
+        f"🧭 <i>{loc.get('desc', loc.get('region', ''))}</i>",
         f"🔬 <i>5 Modelli: ECMWF, ICON, M-France, GFS, JMA</i>",
         "━━━━━━━━━━━━━━━━━━━━"
     ]
@@ -530,8 +616,8 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
     return "\n\n".join(["\n".join(header), "\n\n".join(body), "\n".join(footer)])
 
 
-def format_single_city_synoptic_message(data: Dict[str, Any], city_key: str) -> str:
-    """Genera l'editoriale sinottico dettagliato e specifico per la singola città scelta."""
+def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -> str:
+    """Genera l'editoriale sinottico dettagliato e specifico per qualsiasi città o coordinata."""
     loc = data["loc"]
     m = data.get("metrics", {})
     updated_at = data.get("updated_at", "")
@@ -543,32 +629,34 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_key: str) -> 
     max_pr = m.get("max_rain_prob", 0.0)
     max_wb = m.get("max_wb", 22.0)
 
-    if city_key == "putignano":
-        title_str = "🔥 <b>QUADRO SINOTTICO DEDICATO: PUTIGNANO & MURGE BARESI</b>"
+    is_rainy = tot_r > 3.0 or max_pr >= 40
+    is_hot = max_t >= 32.0 or max_wb >= 25.0
+
+    if "putignano" in loc["key"].lower():
+        title_str = "🔥 <b>QUADRO SINOTTICO: PUTIGNANO & MURGE BARESI</b>"
         sub_title = "<b>Pulsazione calda anticiclonica, compressione dell'aria e stabilità sul versante adriatico.</b>"
-        synopsis_body = (
-            "L'evoluzione atmosferica sul settore centrale delle Murge e della Puglia centro-meridionale è dominata "
-            "dalla risalita di una matrice anticiclonica subtropicale continentale.\n\n"
-            "📌 <b>Dinamica Termo-Igorometrica:</b>\n"
-            f"• <b>Picco Termico Atteso:</b> <code>{max_t:.1f}°C</code> (con minime notturne attorno a <code>{min_t:.1f}°C</code> e media di <code>{avg_t:.1f}°C</code>).\n"
-            f"• <b>Bulbo Umido (Wet Bulb Tw):</b> Valore massimo di <code>{max_wb:.1f}°C</code>. L'aria risulterà asciutta nelle ore centrali del giorno, "
-            "favorendo un'elevata evapotraspirazione senza tassi afosi critici tipici delle zone costiere.\n"
-            f"• <b>Assetto Precipitativo:</b> Cumulato totale stimato in <code>{tot_r:.1f} mm</code> sui 3 giorni (rischio pioggia al {max_pr:.0f}%). "
-            "Assoluta prevalenza di cielo sereno o poco nuvoloso con ventilazione a regime di brezza moderata."
-        )
-    else:  # monza
-        title_str = "⛈️ <b>QUADRO SINOTTICO DEDICATO: MONZA & ALTA PIANURA PADANA</b>"
+        extra_note = "L'evoluzione sul settore centrale delle Murge è dominata dalla risalita di una matrice subtropicale continentale."
+    elif "monza" in loc["key"].lower():
+        title_str = "⛈️ <b>QUADRO SINOTTICO: MONZA & ALTA PIANURA PADANA</b>"
         sub_title = "<b>Fase prefrontale caldo-umida, elevata afa e cedimento instabile con rischio temporali.</b>"
-        synopsis_body = (
-            "La Brianza e l'alta pianura lombarda si collocano lungo il bordo settentrionale di convergenza "
-            "tra il richiamo caldo subtropicale e le infiltrazioni atlantiche in quota.\n\n"
-            "📌 <b>Dinamica Termo-Igorometrica:</b>\n"
-            f"• <b>Comportamento Termico:</b> Massime stimate fino a <code>{max_t:.1f}°C</code> con media di <code>{avg_t:.1f}°C</code>.\n"
-            f"• <b>Bulbo Umido (Wet Bulb Tw):</b> Picco fino a <code>{max_wb:.1f}°C</code>. Il marcato contenuto di umidità nella colonna d'aria "
-            "genererà afa pronunciata e accumulo di energia potenziale convettiva (CAPE).\n"
-            f"• <b>Rischio Instabilità & Temporali:</b> Cumulato medio ensemble di <code>{tot_r:.1f} mm</code> (picco di probabilità al <code>{max_pr:.0f}%</code>). "
-            "I contrasti termici tra aria calda al suolo e correnti fresche atlantiche favoriranno la genesi di rovesci temporaleschi localmente intensi."
-        )
+        extra_note = "La Brianza si colloca lungo il bordo settentrionale di convergenza tra il richiamo caldo e le infiltrazioni atlantiche."
+    else:
+        title_str = f"📡 <b>QUADRO SINOTTICO DEDICATO: {loc['name'].upper()}</b>"
+        if is_rainy:
+            sub_title = "<b>Assetto instabile con passaggi perturbati o contrasti convettivi significativi.</b>"
+        elif is_hot:
+            sub_title = "<b>Regime anticiclonico caldo con marcata compressione termica al suolo.</b>"
+        else:
+            sub_title = "<b>Condizioni di generale equilibrio barico con circolazione standard.</b>"
+        extra_note = f"Analisi specifica calcolata per le coordinate {loc['lat']:.4f}°N, {loc['lon']:.4f}°E ({loc.get('region', '')})."
+
+    synopsis_body = (
+        f"{extra_note}\n\n"
+        "📌 <b>Dinamica Termo-Igorometrica & Modelli:</b>\n"
+        f"• <b>Comportamento Termico:</b> Picco massimo atteso a <code>{max_t:.1f}°C</code> (minima notturna <code>{min_t:.1f}°C</code>, media <code>{avg_t:.1f}°C</code>).\n"
+        f"• <b>Bulbo Umido (Wet Bulb Tw):</b> Valore max <code>{max_wb:.1f}°C</code> ({'Aria asciutta / Comfort' if max_wb < 24 else 'Afa percepita' if max_wb < 28 else 'Stress termico elevato'}).\n"
+        f"• <b>Assetto Precipitativo:</b> Cumulato totale sui 3 giorni stimato in <code>{tot_r:.1f} mm</code> (picco di probabilità al <code>{max_pr:.0f}%</code>)."
+    )
 
     out = [
         title_str,
@@ -583,36 +671,46 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_key: str) -> 
     return "\n".join(out)
 
 
-def get_inline_keyboard(current_city: str = "putignano", current_tab: str = "forecast", only_rain: bool = False) -> Dict[str, Any]:
-    """
-    Genera la tastiera inline con:
-    - Riga 1: Selezione città (Putignano / Monza)
-    - Riga 2: Selezione scheda (Adesso / Previsioni 3gg / Sinottico specifico)
-    - Riga 3: Filtro Solo Pioggia / Aggiorna Live
-    """
-    put_label = "👉 📍 Putignano" if current_city == "putignano" else "📍 Putignano"
-    mon_label = "👉 📍 Monza" if current_city == "monza" else "📍 Monza"
+def get_inline_keyboard(loc_info: Dict[str, Any], current_tab: str = "forecast", only_rain: bool = False, alert_on: bool = False) -> Dict[str, Any]:
+    """Genera la tastiera inline dinamica con selezione città, tab e controlli alert."""
+    cur_key = loc_info.get("key", "putignano")
+
+    put_label = "👉 📍 Putignano" if cur_key == "putignano" else "📍 Putignano"
+    mon_label = "👉 📍 Monza" if cur_key == "monza" else "📍 Monza"
 
     now_label = "👉 🌡️ Adesso" if current_tab == "now" else "🌡️ Adesso"
     fore_label = "👉 📅 Previsioni 3gg" if current_tab == "forecast" else "📅 Previsioni 3gg"
     syn_label = "👉 📡 Sinottico" if current_tab == "synoptic" else "📡 Sinottico"
 
     rain_label = "🌧️ Solo Pioggia (ATTIVO)" if only_rain else "🌧️ Solo Pioggia"
+    alert_label = "🔔 Alert Pioggia: ON" if alert_on else "🔕 Alert Pioggia: OFF"
+
+    # Riga 1: Predefinite o indicatore località attiva
+    row1 = [
+        {"text": put_label, "callback_data": f"loc_putignano_{current_tab}"},
+        {"text": mon_label, "callback_data": f"loc_monza_{current_tab}"}
+    ]
+
+    # Se la località corrente è personalizzata (non Putignano e non Monza), mostra badge
+    if cur_key not in ("putignano", "monza"):
+        loc_short = loc_info.get("name", "Custom")[:16]
+        row1.append({"text": f"👉 📍 {loc_short}", "callback_data": f"loc_custom_{current_tab}"})
 
     return {
         "inline_keyboard": [
+            row1,
             [
-                {"text": put_label, "callback_data": f"city_putignano_{current_tab}"},
-                {"text": mon_label, "callback_data": f"city_monza_{current_tab}"}
-            ],
-            [
-                {"text": now_label, "callback_data": f"tab_{current_city}_now"},
-                {"text": fore_label, "callback_data": f"tab_{current_city}_forecast"},
-                {"text": syn_label, "callback_data": f"tab_{current_city}_synoptic"}
+                {"text": now_label, "callback_data": f"tab_{current_tab}_now"},
+                {"text": fore_label, "callback_data": f"tab_{current_tab}_forecast"},
+                {"text": syn_label, "callback_data": f"tab_{current_tab}_synoptic"}
             ],
             [
                 {"text": rain_label, "callback_data": f"toggle_rain_{'off' if only_rain else 'on'}"},
-                {"text": "🔄 Aggiorna Live", "callback_data": f"refresh_{current_city}_{current_tab}"}
+                {"text": alert_label, "callback_data": f"toggle_alert_{'off' if alert_on else 'on'}"}
+            ],
+            [
+                {"text": "🔍 Cerca Altra Città / GPS", "callback_data": "help_search"},
+                {"text": "🔄 Aggiorna Live", "callback_data": f"refresh_{current_tab}"}
             ]
         ]
     }
@@ -701,15 +799,93 @@ class TelegramBotClient:
             {"command": "adesso", "description": "Temperatura e meteo in tempo reale"},
             {"command": "putignano", "description": "Previsioni 3 giorni per Putignano"},
             {"command": "monza", "description": "Previsioni 3 giorni per Monza"},
-            {"command": "sinottico_putignano", "description": "Quadro sinottico Putignano & Sud"},
-            {"command": "sinottico_monza", "description": "Quadro sinottico Monza & Nord"},
+            {"command": "citta", "description": "Cerca qualsiasi città (es. /citta Roma)"},
+            {"command": "coord", "description": "Previsioni per coordinate GPS (es. /coord 40.85 17.12)"},
+            {"command": "sinottico", "description": "Quadro sinottico specialistico"},
+            {"command": "alert_on", "description": "Attiva gli avvisi di pioggia imminente"},
+            {"command": "alert_off", "description": "Disattiva gli avvisi di pioggia"},
+            {"command": "alert_punto1", "description": "Imposta il Punto 1 di allerta (es. /alert_punto1 Putignano)"},
+            {"command": "alert_punto2", "description": "Imposta il Punto 2 di allerta (es. /alert_punto2 Monza)"},
+            {"command": "alert_status", "description": "Verifica lo stato dei 2 punti monitorati"},
             {"command": "pioggia", "description": "Filtro solo ore con pioggia"},
-            {"command": "help", "description": "Guida completa e spiegazione modelli"}
+            {"command": "help", "description": "Guida completa e spiegazione"}
         ]
         try:
             self._call("setMyCommands", {"commands": commands})
         except Exception:
             pass
+
+
+# ==============================================================================
+# MONITOR ALLERTA PIOGGIA IMMINENTE (MULTI-PUNTO IN BACKGROUND)
+# ==============================================================================
+class RainAlertMonitor:
+    def __init__(self, bot_runner: 'WeatherBotRunner'):
+        self.bot_runner = bot_runner
+        self._sent_alerts: Dict[str, float] = {}  # key: f"{chat_id}_{point_idx}_{hour_str}", val: timestamp
+
+    def start_background_loop(self) -> None:
+        def _loop() -> None:
+            print(" [*] RainAlertMonitor avviato: monitoraggio pioggia multi-punto attivo.")
+            time.sleep(45)  # Attesa iniziale dopo boot
+            while True:
+                try:
+                    self.check_all_subscribed_users()
+                except Exception as err:
+                    print(f"[!] Errore nel monitor pioggia: {err}", file=sys.stderr)
+                time.sleep(1800)  # Controlla ogni 30 minuti
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+
+    def check_all_subscribed_users(self) -> None:
+        for chat_id, alert_enabled in list(self.bot_runner.user_alerts_enabled.items()):
+            if not alert_enabled:
+                continue
+
+            points = self.bot_runner.get_user_alert_points(chat_id)
+            for idx, loc in enumerate(points):
+                try:
+                    data = parse_location_forecast(loc, force_refresh=True, days=1)
+                    hours = data.get("hours", [])
+                    local_now = data.get("local_now", datetime.now())
+
+                    # Trova lo slot orario corrente e i successivi 3
+                    upcoming_slots = [h for h in hours if h["dt"] >= local_now - timedelta(minutes=30)][:3]
+                    for slot in upcoming_slots:
+                        rain_mm = slot.get("rain_mm", 0.0)
+                        rain_prob = slot.get("rain_prob", 0.0)
+
+                        if rain_mm >= 0.5 or rain_prob >= 50.0:
+                            alert_key = f"{chat_id}_{idx}_{slot['day']}_{slot['hour']}"
+                            last_sent = self._sent_alerts.get(alert_key, 0)
+                            if time.time() - last_sent > 14400:  # 4 ore di cooldown per lo stesso slot
+                                self._sent_alerts[alert_key] = time.time()
+                                self.send_rain_notification(chat_id, idx + 1, loc, slot)
+                                break
+                except Exception as e:
+                    print(f"[!] Errore controllo pioggia per chat {chat_id}, punto {idx+1}: {e}", file=sys.stderr)
+
+    def send_rain_notification(self, chat_id: int, point_num: int, loc: Dict[str, Any], slot: Dict[str, Any]) -> None:
+        msg = [
+            "⚠️ <b>ALLERTA PIOGGIA IMMINENTE</b>",
+            f"📍 <b>Punto {point_num} Monitorato:</b> {loc['name']}",
+            f"🕒 <b>Fascia oraria a rischio:</b> <b>{slot['day']} alle ore {slot['hour']}</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"{slot['wmo_icon']} <b>Condizione:</b> {slot['wmo_label']}",
+            f"🌧️ <b>Precipitazioni stimate:</b> <code>{slot['rain_mm']:.2f} mm</code>",
+            f"🎯 <b>Probabilità di pioggia:</b> <code>{slot['rain_prob']:.0f}%</code>",
+            f"🌡️ <b>Temperatura prevista:</b> <code>{slot['temp']:.1f}°C</code> (Tw <code>{slot['wet_bulb']:.1f}°C</code>)",
+            f"💨 <b>Vento:</b> <code>{slot['wind_spd']:.1f} km/h</code> da <code>{slot['wind_dir']}</code>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🔬 <i>Avviso automatico generato dall'Ensemble Multi-Modello (ECMWF, ICON, M-France, GFS, JMA).</i>\n"
+            "<i>Per disattivare gli avvisi invia /alert_off</i>"
+        ]
+        try:
+            self.bot_runner.client.send_message(chat_id, "\n".join(msg))
+            print(f" [✓] Alert pioggia inviato con successo a chat {chat_id} per {loc['name']}.")
+        except Exception as e:
+            print(f" [!] Impossibile inviare notifica a chat {chat_id}: {e}", file=sys.stderr)
 
 
 # ==============================================================================
@@ -719,10 +895,25 @@ class WeatherBotRunner:
     def __init__(self, token: str):
         self.client = TelegramBotClient(token)
         self.bot_info: Dict[str, Any] = {}
-        # Mantiene per ogni utente/chat lo stato corrente
+        
+        # Stato utente
         self.user_rain_mode: Dict[int, bool] = {}
-        self.user_current_city: Dict[int, str] = {}
+        self.user_current_location: Dict[int, Dict[str, Any]] = {}
         self.user_current_tab: Dict[int, str] = {}
+        self.user_alerts_enabled: Dict[int, bool] = {}
+        
+        # Configurazione 2 punti di allerta per utente: [Punto1, Punto2]
+        self.user_alert_points: Dict[int, List[Dict[str, Any]]] = {}
+
+        self.alert_monitor = RainAlertMonitor(self)
+
+    def get_user_loc(self, chat_id: int) -> Dict[str, Any]:
+        return self.user_current_location.get(chat_id, DEFAULT_LOCATIONS["putignano"])
+
+    def get_user_alert_points(self, chat_id: int) -> List[Dict[str, Any]]:
+        if chat_id not in self.user_alert_points:
+            self.user_alert_points[chat_id] = [DEFAULT_LOCATIONS["putignano"], DEFAULT_LOCATIONS["monza"]]
+        return self.user_alert_points[chat_id]
 
     def start(self) -> None:
         try:
@@ -737,6 +928,7 @@ class WeatherBotRunner:
             print(" Premi CTRL+C per arrestare.")
             print("=" * 65 + "\n")
             self.client.set_commands()
+            self.alert_monitor.start_background_loop()
         except Exception as e:
             print(f"[!] Errore critico di connessione a Telegram: {e}", file=sys.stderr)
             print("[!] Verifica che il TELEGRAM_BOT_TOKEN inserito sia corretto.", file=sys.stderr)
@@ -767,85 +959,186 @@ class WeatherBotRunner:
 
     def handle_message(self, message: Dict[str, Any]) -> None:
         chat_id = message.get("chat", {}).get("id")
-        text = (message.get("text") or "").strip().lower()
+        text = (message.get("text") or "").strip()
+        loc_msg = message.get("location")
 
         if not chat_id:
             return
 
-        city = self.user_current_city.get(chat_id, "putignano")
-
-        if text in ("/start", "/menu", "menu"):
-            self.user_current_city[chat_id] = "putignano"
-            self.user_current_tab[chat_id] = "forecast"
-            self.send_view(chat_id, "putignano", "forecast")
-
-        elif text in ("/adesso", "adesso", "/ora", "ora", "/live", "live", "/temperatura"):
+        # 1. GESTIONE POSIZIONE GPS INVIATA VIA TELEGRAM (Clip -> Posizione)
+        if loc_msg:
+            lat = float(loc_msg.get("latitude", 0.0))
+            lon = float(loc_msg.get("longitude", 0.0))
+            custom_loc = {
+                "key": f"gps_{lat:.4f}_{lon:.4f}",
+                "name": f"📍 GPS ({lat:.3f}°N, {lon:.3f}°E)",
+                "lat": lat,
+                "lon": lon,
+                "region": "Posizione GPS Inviata",
+                "desc": f"Coordinate GPS rilevate: {lat:.4f}°N, {lon:.4f}°E"
+            }
+            self.user_current_location[chat_id] = custom_loc
             self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, city, "now", force_refresh=True)
+            self.client.send_message(chat_id, f"📍 <b>Posizione GPS acquisita con successo!</b>\nCalcolo previsioni per {lat:.4f}°N, {lon:.4f}°E...")
+            self.send_view(chat_id, custom_loc, "now", force_refresh=True)
+            return
 
-        elif text in ("/adesso_putignano", "adesso putignano", "/ora_putignano"):
-            self.user_current_city[chat_id] = "putignano"
-            self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, "putignano", "now", force_refresh=True)
+        low_text = text.lower()
 
-        elif text in ("/adesso_monza", "adesso monza", "/ora_monza"):
-            self.user_current_city[chat_id] = "monza"
-            self.user_current_tab[chat_id] = "now"
-            self.send_view(chat_id, "monza", "now", force_refresh=True)
-
-        elif text in ("/putignano", "putignano"):
-            self.user_current_city[chat_id] = "putignano"
+        # 2. COMANDI STANDARD
+        if low_text in ("/start", "/menu", "menu"):
+            self.user_current_location[chat_id] = DEFAULT_LOCATIONS["putignano"]
             self.user_current_tab[chat_id] = "forecast"
-            self.send_view(chat_id, "putignano", "forecast")
+            self.send_view(chat_id, DEFAULT_LOCATIONS["putignano"], "forecast")
 
-        elif text in ("/monza", "monza"):
-            self.user_current_city[chat_id] = "monza"
+        elif low_text in ("/adesso", "adesso", "/ora", "ora", "/live", "live", "/temperatura"):
+            cur_loc = self.get_user_loc(chat_id)
+            self.user_current_tab[chat_id] = "now"
+            self.send_view(chat_id, cur_loc, "now", force_refresh=True)
+
+        elif low_text in ("/putignano", "putignano"):
+            self.user_current_location[chat_id] = DEFAULT_LOCATIONS["putignano"]
             self.user_current_tab[chat_id] = "forecast"
-            self.send_view(chat_id, "monza", "forecast")
+            self.send_view(chat_id, DEFAULT_LOCATIONS["putignano"], "forecast")
 
-        elif text in ("/sinottico_putignano", "sinottico putignano"):
-            self.user_current_city[chat_id] = "putignano"
+        elif low_text in ("/monza", "monza"):
+            self.user_current_location[chat_id] = DEFAULT_LOCATIONS["monza"]
+            self.user_current_tab[chat_id] = "forecast"
+            self.send_view(chat_id, DEFAULT_LOCATIONS["monza"], "forecast")
+
+        elif low_text in ("/sinottico", "sinottico", "/editoriale", "editoriale"):
+            cur_loc = self.get_user_loc(chat_id)
             self.user_current_tab[chat_id] = "synoptic"
-            self.send_view(chat_id, "putignano", "synoptic")
+            self.send_view(chat_id, cur_loc, "synoptic")
 
-        elif text in ("/sinottico_monza", "sinottico monza"):
-            self.user_current_city[chat_id] = "monza"
-            self.user_current_tab[chat_id] = "synoptic"
-            self.send_view(chat_id, "monza", "synoptic")
-
-        elif text in ("/sinottico", "sinottico", "/editoriale", "editoriale"):
-            self.user_current_tab[chat_id] = "synoptic"
-            self.send_view(chat_id, city, "synoptic")
-
-        elif text in ("/pioggia", "pioggia", "/solo-pioggia"):
+        elif low_text in ("/pioggia", "pioggia", "/solo-pioggia"):
             current_mode = self.user_rain_mode.get(chat_id, False)
             self.user_rain_mode[chat_id] = not current_mode
+            cur_loc = self.get_user_loc(chat_id)
             cur_tab = self.user_current_tab.get(chat_id, "forecast")
-            self.send_view(chat_id, city, cur_tab)
+            self.send_view(chat_id, cur_loc, cur_tab)
 
-        elif text in ("/help", "help", "guida"):
+        # 3. COMANDI ALERT PIOGGIA
+        elif low_text in ("/alert_on", "alert_on", "/alert on"):
+            self.user_alerts_enabled[chat_id] = True
+            pts = self.get_user_alert_points(chat_id)
+            self.client.send_message(
+                chat_id,
+                "🔔 <b>Avvisi automatici di pioggia ATTIVATI!</b>\n\n"
+                f"Punti monitorati in background:\n"
+                f"• <b>Punto 1:</b> {pts[0]['name']}\n"
+                f"• <b>Punto 2:</b> {pts[1]['name']}\n\n"
+                "<i>Riceverai una notifica ogni volta che i modelli prevedono pioggia imminente (probabilità >= 50%).</i>",
+                reply_markup=get_inline_keyboard(self.get_user_loc(chat_id), self.user_current_tab.get(chat_id, "forecast"), self.user_rain_mode.get(chat_id, False), True)
+            )
+
+        elif low_text in ("/alert_off", "alert_off", "/alert off"):
+            self.user_alerts_enabled[chat_id] = False
+            self.client.send_message(
+                chat_id,
+                "🔕 <b>Avvisi automatici di pioggia DISATTIVATI.</b>",
+                reply_markup=get_inline_keyboard(self.get_user_loc(chat_id), self.user_current_tab.get(chat_id, "forecast"), self.user_rain_mode.get(chat_id, False), False)
+            )
+
+        elif low_text.startswith("/alert_punto1") or low_text.startswith("/alert_pos1"):
+            query = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+            if not query:
+                self.client.send_message(chat_id, "ℹ️ Specifica la città o le coordinate per il Punto 1. Es:\n<code>/alert_punto1 Putignano</code> oppure <code>/alert_punto1 40.85 17.12</code>")
+                return
+            loc_res = resolve_location(query)
+            pts = self.get_user_alert_points(chat_id)
+            pts[0] = loc_res
+            self.user_alert_points[chat_id] = pts
+            self.client.send_message(chat_id, f"✅ <b>Punto 1 di allerta impostato su:</b>\n📍 <b>{loc_res['name']}</b> ({loc_res.get('desc', '')})")
+
+        elif low_text.startswith("/alert_punto2") or low_text.startswith("/alert_pos2"):
+            query = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+            if not query:
+                self.client.send_message(chat_id, "ℹ️ Specifica la città o le coordinate per il Punto 2. Es:\n<code>/alert_punto2 Monza</code> oppure <code>/alert_punto2 45.56 9.24</code>")
+                return
+            loc_res = resolve_location(query)
+            pts = self.get_user_alert_points(chat_id)
+            pts[1] = loc_res
+            self.user_alert_points[chat_id] = pts
+            self.client.send_message(chat_id, f"✅ <b>Punto 2 di allerta impostato su:</b>\n📍 <b>{loc_res['name']}</b> ({loc_res.get('desc', '')})")
+
+        elif low_text in ("/alert_status", "alert status", "/alert"):
+            status_str = "🟢 ATTIVI" if self.user_alerts_enabled.get(chat_id, False) else "🔴 DISATTIVATI"
+            pts = self.get_user_alert_points(chat_id)
+            self.client.send_message(
+                chat_id,
+                f"⚙️ <b>STATO MONITOR ALLERTA PIOGGIA:</b> {status_str}\n\n"
+                f"📍 <b>Punto 1:</b> {pts[0]['name']}\n   └ <i>{pts[0].get('desc', '')}</i>\n"
+                f"📍 <b>Punto 2:</b> {pts[1]['name']}\n   └ <i>{pts[1].get('desc', '')}</i>\n\n"
+                "• Per cambiare il Punto 1: <code>/alert_punto1 NomeCittà</code>\n"
+                "• Per cambiare il Punto 2: <code>/alert_punto2 NomeCittà</code>\n"
+                "• Per attivare/spegnere: <code>/alert_on</code> o <code>/alert_off</code>"
+            )
+
+        # 4. RICERCA ESPLICITA CITTA O COORDINATE
+        elif low_text.startswith("/citta ") or low_text.startswith("/cerca "):
+            query = text.split(maxsplit=1)[1]
+            self.execute_search_and_show(chat_id, query)
+
+        elif low_text.startswith("/coord "):
+            query = text.split(maxsplit=1)[1]
+            parsed_c = parse_coordinates_text(query)
+            if parsed_c:
+                self.user_current_location[chat_id] = parsed_c
+                self.user_current_tab[chat_id] = "now"
+                self.send_view(chat_id, parsed_c, "now", force_refresh=True)
+            else:
+                self.client.send_message(chat_id, "⚠️ Formato coordinate non valido. Usa ad esempio:\n<code>/coord 40.8505 17.1235</code>")
+
+        elif low_text in ("/help", "help", "guida"):
             help_text = (
                 "ℹ️ <b>GUIDA METEO ENSEMBLE BOT</b>\n\n"
-                "Questo bot aggrega in tempo reale 5 modelli meteorologici mondiali:\n"
-                "• <b>ECMWF IFS:</b> Modello Europeo (alta precisione)\n"
-                "• <b>DWD ICON-EU:</b> Modello Tedesco ad alta risoluzione\n"
-                "• <b>Météo-France:</b> Modello Francese Seamless\n"
-                "• <b>GFS Global:</b> Modello Statunitense NOAA\n"
-                "• <b>JMA:</b> Modello Giapponese\n\n"
-                "🌡️ <b>Funzioni Principali:</b>\n"
-                "• <b>🌡️ Adesso:</b> Temperatura e meteo live istantaneo con Bulbo Umido e vento.\n"
-                "• <b>📅 Previsioni 3gg:</b> Quadro completo giornaliero con confronto modelli.\n"
-                "• <b>📡 Sinottico:</b> Editoriale specialistico mirato per la singola città scelta.\n"
-                "• <b>🌧️ Solo Pioggia:</b> Filtra per mostrare solo le ore con precipitazioni attese.\n\n"
-                "Usa la tastiera interattiva sotto:"
+                "Questo bot confronta in tempo reale 5 modelli meteorologici mondiali:\n"
+                "• <b>ECMWF IFS (UE)</b> • <b>DWD ICON-EU (DE)</b> • <b>Météo-France (FR)</b>\n"
+                "• <b>GFS Global (USA)</b> • <b>JMA Seamless (JP)</b>\n\n"
+                "🔍 <b>Ricerca Città & Posizione GPS:</b>\n"
+                "• Scrivi il nome di qualsiasi città (es. <code>Roma</code>, <code>Bari</code>, <code>Milano</code>) o usa <code>/citta Firenze</code>.\n"
+                "• Invia la tua posizione GPS toccando la graffetta 📎 -> <b>Posizione</b>.\n"
+                "• Oppure digita direttamente le coordinate: <code>40.8505, 17.1235</code>.\n\n"
+                "🔔 <b>Allerta Pioggia Multi-Punto:</b>\n"
+                "• <code>/alert_on</code> e <code>/alert_off</code> per attivare o spegnere gli avvisi.\n"
+                "• <code>/alert_punto1 Putignano</code> e <code>/alert_punto2 Monza</code> per configurare i 2 punti da monitorare.\n\n"
+                "Usa i pulsanti sotto per navigare:"
             )
+            cur_loc = self.get_user_loc(chat_id)
             self.client.send_message(
                 chat_id,
                 help_text,
-                reply_markup=get_inline_keyboard(city, "forecast", self.user_rain_mode.get(chat_id, False))
+                reply_markup=get_inline_keyboard(cur_loc, "forecast", self.user_rain_mode.get(chat_id, False), self.user_alerts_enabled.get(chat_id, False))
             )
         else:
-            self.send_view(chat_id, city, "forecast")
+            # Prova a interpretare il messaggio dell'utente come città o coordinate
+            coords = parse_coordinates_text(text)
+            if coords:
+                self.user_current_location[chat_id] = coords
+                self.user_current_tab[chat_id] = "now"
+                self.send_view(chat_id, coords, "now", force_refresh=True)
+            else:
+                geocoded = geocode_city(text)
+                if geocoded:
+                    self.user_current_location[chat_id] = geocoded
+                    self.user_current_tab[chat_id] = "forecast"
+                    self.send_view(chat_id, geocoded, "forecast")
+                else:
+                    cur_loc = self.get_user_loc(chat_id)
+                    self.send_view(chat_id, cur_loc, "forecast")
+
+    def execute_search_and_show(self, chat_id: int, query: str) -> None:
+        geocoded = geocode_city(query)
+        if geocoded:
+            self.user_current_location[chat_id] = geocoded
+            self.user_current_tab[chat_id] = "forecast"
+            self.send_view(chat_id, geocoded, "forecast")
+        else:
+            self.client.send_message(
+                chat_id,
+                f"⚠️ Impossibile trovare la città <b>'{query}'</b>. Prova a verificare l'ortografia o a inviare le coordinate numeriche."
+            )
 
     def handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id")
@@ -858,36 +1151,26 @@ class WeatherBotRunner:
             return
 
         force_refresh = False
-        cur_city = self.user_current_city.get(chat_id, "putignano")
+        cur_loc = self.get_user_loc(chat_id)
         cur_tab = self.user_current_tab.get(chat_id, "forecast")
         cur_rain = self.user_rain_mode.get(chat_id, False)
 
-        if data.startswith("city_"):
-            parts = data.replace("city_", "").split("_")
-            cur_city = parts[0]
-            if len(parts) > 1:
-                cur_tab = parts[1]
-            self.user_current_city[chat_id] = cur_city
-            self.user_current_tab[chat_id] = cur_tab
-            self.client.answer_callback_query(cb_id, text=f"Selezionato: {cur_city.capitalize()}")
+        if data.startswith("loc_"):
+            loc_key = data.split("_")[1]
+            if loc_key in DEFAULT_LOCATIONS:
+                cur_loc = DEFAULT_LOCATIONS[loc_key]
+                self.user_current_location[chat_id] = cur_loc
+            self.client.answer_callback_query(cb_id, text=f"Selezionato: {cur_loc['name']}")
 
         elif data.startswith("tab_"):
-            parts = data.replace("tab_", "").split("_")
-            cur_city = parts[0]
-            cur_tab = parts[1]
+            target_tab = data.split("_")[2]
+            cur_tab = target_tab
+            self.user_current_tab[chat_id] = cur_tab
             if cur_tab == "now":
                 force_refresh = True
-            self.user_current_city[chat_id] = cur_city
-            self.user_current_tab[chat_id] = cur_tab
-            self.client.answer_callback_query(cb_id, text=f"Caricamento {cur_tab.capitalize()}...")
+            self.client.answer_callback_query(cb_id, text=f"Scheda: {cur_tab.capitalize()}")
 
         elif data.startswith("refresh_"):
-            parts = data.replace("refresh_", "").split("_")
-            cur_city = parts[0]
-            if len(parts) > 1:
-                cur_tab = parts[1]
-            self.user_current_city[chat_id] = cur_city
-            self.user_current_tab[chat_id] = cur_tab
             force_refresh = True
             self.client.answer_callback_query(cb_id, text="Aggiornamento modelli live...")
 
@@ -901,41 +1184,62 @@ class WeatherBotRunner:
             cur_rain = False
             self.client.answer_callback_query(cb_id, text="Filtro Solo Pioggia DISATTIVATO")
 
-        self.update_view(chat_id, message_id, cur_city, cur_tab, cur_rain, force_refresh=force_refresh)
+        elif data == "toggle_alert_on":
+            self.user_alerts_enabled[chat_id] = True
+            self.client.answer_callback_query(cb_id, text="Allerta Pioggia ATTIVATA")
 
-    def get_content_for_view(self, city: str, tab: str, only_rain: bool = False, force_refresh: bool = False) -> str:
-        data = parse_location_forecast(city, force_refresh=force_refresh)
+        elif data == "toggle_alert_off":
+            self.user_alerts_enabled[chat_id] = False
+            self.client.answer_callback_query(cb_id, text="Allerta Pioggia DISATTIVATA")
+
+        elif data == "help_search":
+            self.client.answer_callback_query(cb_id)
+            self.client.send_message(
+                chat_id,
+                "🔍 <b>COME CERCARE QUALSIASI CITTÀ O INVIARE LA POSIZIONE:</b>\n\n"
+                "1. <b>Nome Città:</b> Scrivi semplicemente il nome in chat (es. <code>Bari</code>, <code>Roma</code>, <code>Napoli</code>).\n"
+                "2. <b>Posizione GPS:</b> Tocca l'icona 📎 (graffetta) -> <b>Posizione</b> per inviare la tua posizione esatta.\n"
+                "3. <b>Coordinate Numeriche:</b> Invia latitudine e longitudine (es. <code>40.8505, 17.1235</code>)."
+            )
+            return
+
+        self.update_view(chat_id, message_id, cur_loc, cur_tab, cur_rain, force_refresh=force_refresh)
+
+    def get_content_for_view(self, loc: Dict[str, Any], tab: str, only_rain: bool = False, force_refresh: bool = False) -> str:
+        data = parse_location_forecast(loc, force_refresh=force_refresh)
         if tab == "now":
             return format_current_weather_message(data)
         elif tab == "synoptic":
-            return format_single_city_synoptic_message(data, city)
+            return format_single_city_synoptic_message(data, loc["key"])
         else:
             return format_city_weather_message(data, only_rain=only_rain)
 
-    def send_view(self, chat_id: int, city: str, tab: str, force_refresh: bool = False) -> None:
+    def send_view(self, chat_id: int, loc: Dict[str, Any], tab: str, force_refresh: bool = False) -> None:
         try:
             only_rain = self.user_rain_mode.get(chat_id, False)
-            text = self.get_content_for_view(city, tab, only_rain=only_rain, force_refresh=force_refresh)
-            self.client.send_message(chat_id, text, reply_markup=get_inline_keyboard(city, tab, only_rain))
+            alert_on = self.user_alerts_enabled.get(chat_id, False)
+            text = self.get_content_for_view(loc, tab, only_rain=only_rain, force_refresh=force_refresh)
+            self.client.send_message(chat_id, text, reply_markup=get_inline_keyboard(loc, tab, only_rain, alert_on))
         except Exception as e:
             self.client.send_message(
                 chat_id,
-                f"⚠️ <b>Errore nel recupero dati meteo:</b>\n<code>{str(e)}</code>",
-                reply_markup=get_inline_keyboard(city, tab, self.user_rain_mode.get(chat_id, False))
+                f"⚠️ <b>Errore nel recupero dati meteo:</b>\n<code>{str(e)}</code>"
             )
 
-    def update_view(self, chat_id: int, message_id: int, city: str, tab: str, only_rain: bool, force_refresh: bool = False) -> None:
+    def update_view(self, chat_id: int, message_id: int, loc: Dict[str, Any], tab: str, only_rain: bool, force_refresh: bool = False) -> None:
         try:
-            text = self.get_content_for_view(city, tab, only_rain=only_rain, force_refresh=force_refresh)
-            self.client.edit_message_text(chat_id, message_id, text, reply_markup=get_inline_keyboard(city, tab, only_rain))
+            text = self.get_content_for_view(loc, tab, only_rain=only_rain, force_refresh=force_refresh)
+            alert_on = self.user_alerts_enabled.get(chat_id, False)
+            self.client.edit_message_text(chat_id, message_id, text, reply_markup=get_inline_keyboard(loc, tab, only_rain, alert_on))
         except Exception as e:
             err_msg = str(e)
             if "message is not modified" not in err_msg.lower():
                 try:
+                    alert_on = self.user_alerts_enabled.get(chat_id, False)
                     self.client.edit_message_text(
                         chat_id, message_id,
                         f"⚠️ <b>Errore durante l'aggiornamento:</b>\n<code>{err_msg}</code>",
-                        reply_markup=get_inline_keyboard(city, tab, only_rain)
+                        reply_markup=get_inline_keyboard(loc, tab, only_rain, alert_on)
                     )
                 except Exception:
                     pass
@@ -958,7 +1262,6 @@ RUNTIME_METRICS = {
 # ==============================================================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
-        # Silenzia i log interni HTTP
         pass
 
     def _get_uptime_str(self) -> str:
@@ -977,7 +1280,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         RUNTIME_METRICS["http_requests"] += 1
         parsed_path = urllib.parse.urlparse(self.path).path
 
-        # Endpoint JSON per UptimeRobot / cron / status
         if parsed_path in ("/health", "/healthz", "/ping", "/status", "/json"):
             payload = json.dumps({
                 "status": "HEALTHY",
@@ -999,7 +1301,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        # Dashboard HTML
         uptime_str = self._get_uptime_str()
         ping_status = RUNTIME_METRICS["last_ping_status"] or "In attesa"
 
@@ -1109,7 +1410,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     <div class="card">
         <div class="badge">ONLINE &amp; ACTIVE 24/7</div>
         <h1>🌦️ Meteo <span>Ensemble Bot</span></h1>
-        <p class="subtitle">Putignano &bull; Monza &bull; 5 Modelli Multi-Forecast</p>
+        <p class="subtitle">5 Modelli &bull; Geocoding &bull; GPS &bull; Alert Pioggia</p>
         
         <div class="stats-grid">
             <div class="stat-box">
@@ -1147,7 +1448,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def start_health_check_server(port: int = 8080) -> None:
-    """Avvia un server HTTP leggero in un thread demone per soddisfare il port scan di Render/Koyeb."""
     try:
         server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1158,7 +1458,6 @@ def start_health_check_server(port: int = 8080) -> None:
 
 
 def start_keep_alive_pinger(target_url: str, interval_seconds: int = 540) -> None:
-    """Invia richieste periodiche GET all'endpoint di monitoraggio per prevenire lo sleep su Render Free."""
     if not target_url or not target_url.startswith("http"):
         print(" [i] Keep-Alive Pinger: Nessun URL esterno configurato (modalità locale attiva).")
         return
@@ -1201,12 +1500,10 @@ def start_keep_alive_pinger(target_url: str, interval_seconds: int = 540) -> Non
 # ENTRY POINT
 # ==============================================================================
 def main() -> None:
-    # 1. Avvio server HTTP in background per Render ($PORT)
     port_env = os.environ.get("PORT")
     port = int(port_env) if port_env and port_env.isdigit() else 8080
     start_health_check_server(port)
 
-    # 2. Configura e avvia il Keep-Alive Pinger automatico
     target_url = (
         os.environ.get("RENDER_EXTERNAL_URL") or
         os.environ.get("PING_URL") or
@@ -1216,7 +1513,6 @@ def main() -> None:
     interval = int(interval_env) if interval_env and interval_env.isdigit() else 540
     start_keep_alive_pinger(target_url, interval_seconds=interval)
 
-    # 3. Parsing argomenti e token Telegram
     parser = argparse.ArgumentParser(description="Meteo Ensemble - Telegram Bot")
     parser.add_argument("--token", "-t", default=None, help="Telegram Bot Token (oppure usa variabile d'ambiente TELEGRAM_BOT_TOKEN)")
     args = parser.parse_args()
