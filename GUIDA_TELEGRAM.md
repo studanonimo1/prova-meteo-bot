@@ -1,6 +1,6 @@
 # 🌦️ Meteo Ensemble Hub - Bot Telegram Cloud 24/7
 
-Guida rapida per configurare e usare il tuo Bot Telegram su **Render.com** (o locale) con previsioni multi-modello, ricerca città globale, invio posizione GPS, monitor di allerta pioggia automatico e **mappe grafiche meteo ad alto contrasto**.
+Guida rapida per configurare e usare il tuo Bot Telegram su **Render.com** (o locale) con previsioni multi-modello, ricerca città globale, invio posizione GPS, monitor di allerta pioggia automatico, mappe grafiche e **protezione anti-rate-limit 429 con degradazione adattiva dei modelli**.
 
 ---
 
@@ -30,16 +30,24 @@ Guida rapida per configurare e usare il tuo Bot Telegram su **Render.com** (o lo
 
 ---
 
+## 🛡️ Sistema di Resilienza & Degradazione Adattiva (Zero Errori 429)
+
+Se l'infrastruttura condivisa in cloud supera temporaneamente i limiti di chiamate simultanee di Open-Meteo (`HTTP Error 429`), il bot adotta una strategia a scalini trasparente:
+1. **Tier 1:** Ensemble Completo a 5 Modelli (*ECMWF, ICON, M-France, GFS, JMA*).
+2. **Tier 2:** 4 Modelli (*ECMWF, ICON, M-France, GFS*).
+3. **Tier 3:** 3 Modelli (*ECMWF, ICON, GFS*).
+4. **Tier 4:** 2 Modelli (*ECMWF, ICON*).
+5. **Tier 5:** 1 Modello (*ECMWF*).
+6. **Tier 6:** Modello Singolo Ottimizzato (*Open-Meteo Best Match* a bassissimo consumo).
+7. **Tier 7 (Last-Known-Good Cache):** Se l'IP è temporaneamente saturato, mostra l'ultima previsione valida disponibile con la dicitura *"Modalità Risparmio API"*, senza mai restituire errori o bloccare l'utente.
+
+---
+
 ## 📱 Guida alle Funzionalità
 
 ### 🗺️ 1. Mappe Meteo Statica PNG ad Alto Contrasto
 * **Pulsante dedicato:** Tocca **`[ 🗺️ Mappa ]`** nella tastiera Telegram per ricevere all'istante l'immagine satellitare/stradale centrate sulla tua città.
 * **Comando Mappa:** Invia `/mappa` (per la località attiva) o `/mappa <nome città / coordinate>` (es. `/mappa Roma` o `/mappa 40.85 17.12`).
-* **Cosa include l'immagine generata con Pillow:**
-  - Mappa geografica locale ad alta definizione (raggio ~30 km).
-  - Pin GPS e radar circolare con coordinate esatte.
-  - Cartellino **Temperatura Attuale (°C)** e condizioni meteorologiche.
-  - Cartellino **Precipitazioni 24h**: probabilità cumulata (%), stima millimetri (mm) e badge di rischio (Basso / Moderato / Allerta).
 
 ### 🔍 2. Ricerca Qualsiasi Città & Posizione GPS
 * **Ricerca per Nome:** Scrivi semplicemente il nome di qualsiasi città in chat (es. `Roma`, `Bari`, `Milano`, `Londra`) oppure usa `/citta Firenze`.
@@ -47,7 +55,7 @@ Guida rapida per configurare e usare il tuo Bot Telegram su **Render.com** (o lo
 * **Coordinate Numeriche:** Invia latitudine e longitudine separate da virgola o spazio (es. `40.8505, 17.1235` o `/coord 45.56 9.24`).
 
 ### 🔔 3. Allerta Pioggia Imminente su 2 Punti di Interesse
-Il bot include un **monitor in background** che controlla ogni 30 minuti l'arrivo di piogge imminenti:
+Il bot include un **monitor in background** intelligente che controlla ogni 30 minuti l'arrivo di piogge imminenti:
 * `/alert_on` - Attiva gli avvisi automatici (ti invia un messaggio se la pioggia è prevista entro 2-3 ore).
 * `/alert_off` - Disattiva gli avvisi.
 * `/alert_punto1 <città o coord>` - Imposta il **Punto 1** di allerta (es. `/alert_punto1 Putignano`).
