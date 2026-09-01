@@ -74,6 +74,16 @@ MODELS = {
     "jma_seamless": "JMA (JP)"
 }
 
+# Livelli di degradazione adattiva per superare i rate-limit 429 di Open-Meteo
+MODEL_TIERS = [
+    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],  # 5 modelli completi
+    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global"],                 # 4 modelli
+    ["ecmwf_ifs025", "dwd_icon_eu", "gfs_global"],                                        # 3 modelli
+    ["ecmwf_ifs025", "dwd_icon_eu"],                                                       # 2 modelli
+    ["ecmwf_ifs025"],                                                                      # 1 modello (ECMWF)
+    []                                                                                     # Fallback Best Match standard
+]
+
 GIORNI_ITA = {
     "Monday": "Lunedì",
     "Tuesday": "Martedì",
@@ -116,12 +126,13 @@ WMO_WEATHER_CODES = {
 }
 
 # ==============================================================================
-# CACHE MANAGER THREAD-SAFE
+# CACHE MANAGER THREAD-SAFE (CON SUPPORTO LAST-KNOWN-GOOD FALLBACK)
 # ==============================================================================
 class CacheManager:
     def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
         self.ttl = ttl_seconds
         self._cache: Dict[str, Dict[str, Any]] = {}
+        self._last_known_good: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
     def get(self, key: str) -> Optional[Any]:
@@ -140,6 +151,11 @@ class CacheManager:
                 "timestamp": time.time(),
                 "data": data
             }
+            self._last_known_good[key] = data
+
+    def get_last_known_good(self, key: str) -> Optional[Any]:
+        with self._lock:
+            return self._last_known_good.get(key)
 
     def clear(self, key: Optional[str] = None) -> None:
         with self._lock:
@@ -258,40 +274,67 @@ def safe_float(val: Any, default: float = 0.0) -> float:
 
 
 def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
-    """Interroga l'API Open-Meteo Multi-Modello con la sola standard library urllib."""
-    models_query = ",".join(MODELS.keys())
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability"
-        f"&models={models_query}"
-        f"&forecast_days={forecast_days}"
-        f"&timezone=auto"
-    )
+    """
+    Interroga l'API Open-Meteo con degradazione adattiva a cascata su errore 429:
+    5 modelli -> 4 modelli -> 3 modelli -> 2 modelli -> 1 modello -> Best Match.
+    """
+    last_error = None
 
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Meteo-Telegram-Bot/3.0"}
-    )
-    for attempt in range(MAX_RETRIES):
+    for tier_idx, models_subset in enumerate(MODEL_TIERS):
+        if models_subset:
+            models_query = f"&models={','.join(models_subset)}"
+            tier_desc = f"{len(models_subset)} modelli ({', '.join([MODELS.get(m, m) for m in models_subset])})"
+        else:
+            models_query = ""
+            tier_desc = "Open-Meteo Best Match (modello singolo ottimizzato)"
+
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability"
+            f"{models_query}"
+            f"&forecast_days={forecast_days}"
+            f"&timezone=auto"
+        )
+
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Meteo-Telegram-Bot/3.0 (Ensemble-Weather-Bot)"}
+        )
+
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                raise RuntimeError(f"Errore connessione Open-Meteo: {e}") from e
-            time.sleep(BASE_RETRY_DELAY * (attempt + 1))
-    raise RuntimeError("Chiamata Open-Meteo fallita.")
+                if resp.status == 200:
+                    raw_json = json.loads(resp.read().decode("utf-8"))
+                    raw_json["_tier_models"] = models_subset
+                    return raw_json
+        except urllib.error.HTTPError as http_err:
+            last_error = http_err
+            if http_err.code == 429:
+                print(f"[!] Rate limit HTTP 429 rilevato su Open-Meteo per {lat},{lon}. Degradazione al livello successivo...", file=sys.stderr)
+                time.sleep(0.3)
+                continue  # Passa immediatamente al tier successivo con meno modelli
+            elif tier_idx < len(MODEL_TIERS) - 1:
+                time.sleep(0.5)
+                continue
+        except Exception as err:
+            last_error = err
+            if tier_idx < len(MODEL_TIERS) - 1:
+                time.sleep(0.5)
+                continue
+
+    raise RuntimeError(f"Errore connessione Open-Meteo dopo degradazione completa: {last_error}")
 
 
 def extract_city_metrics(data: dict) -> dict:
-    """Estrae metriche aggregate e sintetiche per l'elaborazione dell'editoriale."""
+    """Estrae metriche aggregate e sintetiche supportando sia multi-modello che singolo best-match."""
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     if not times:
         return {}
+
+    active_keys = [m for m in MODELS.keys() if f"temperature_2m_{m}" in hourly]
+    is_single_best_match = len(active_keys) == 0 and "temperature_2m" in hourly
 
     all_temps = []
     all_precips = []
@@ -303,15 +346,23 @@ def extract_city_metrics(data: dict) -> dict:
         dt = datetime.fromisoformat(t_str)
         day_str = dt.strftime("%Y-%m-%d")
 
-        t_vals = [safe_float(hourly.get(f"temperature_2m_{m}", [None])[i]) for m in MODELS.keys() if hourly.get(f"temperature_2m_{m}") is not None]
-        p_vals = [safe_float(hourly.get(f"precipitation_{m}", [None])[i]) for m in MODELS.keys() if hourly.get(f"precipitation_{m}") is not None]
-        pr_vals = [safe_float(hourly.get(f"precipitation_probability_{m}", [None])[i]) for m in MODELS.keys() if hourly.get(f"precipitation_probability_{m}") is not None]
-        rh_vals = [safe_float(hourly.get(f"relative_humidity_2m_{m}", [None])[i], 50.0) for m in MODELS.keys() if hourly.get(f"relative_humidity_2m_{m}") is not None]
+        if is_single_best_match:
+            t_val = safe_float(hourly.get("temperature_2m", [0])[i])
+            p_val = safe_float(hourly.get("precipitation", [0])[i])
+            pr_val = safe_float(hourly.get("precipitation_probability", [0])[i])
+            rh_val = safe_float(hourly.get("relative_humidity_2m", [50])[i], 50.0)
+            avg_t, avg_p, avg_pr, avg_rh = t_val, p_val, pr_val, rh_val
+        else:
+            t_vals = [safe_float(hourly.get(f"temperature_2m_{m}", [None])[i]) for m in active_keys if hourly.get(f"temperature_2m_{m}") is not None]
+            p_vals = [safe_float(hourly.get(f"precipitation_{m}", [None])[i]) for m in active_keys if hourly.get(f"precipitation_{m}") is not None]
+            pr_vals = [safe_float(hourly.get(f"precipitation_probability_{m}", [None])[i]) for m in active_keys if hourly.get(f"precipitation_probability_{m}") is not None]
+            rh_vals = [safe_float(hourly.get(f"relative_humidity_2m_{m}", [None])[i], 50.0) for m in active_keys if hourly.get(f"relative_humidity_2m_{m}") is not None]
 
-        avg_t = sum(t_vals) / len(t_vals) if t_vals else 0.0
-        avg_p = sum(p_vals) / len(p_vals) if p_vals else 0.0
-        avg_pr = sum(pr_vals) / len(pr_vals) if pr_vals else 0.0
-        avg_rh = sum(rh_vals) / len(rh_vals) if rh_vals else 50.0
+            avg_t = sum(t_vals) / len(t_vals) if t_vals else 0.0
+            avg_p = sum(p_vals) / len(p_vals) if p_vals else 0.0
+            avg_pr = sum(pr_vals) / len(pr_vals) if pr_vals else 0.0
+            avg_rh = sum(rh_vals) / len(rh_vals) if rh_vals else 50.0
+
         wb = calculate_wet_bulb(avg_t, avg_rh)
 
         all_temps.append(avg_t)
@@ -359,7 +410,7 @@ def resolve_location(target: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: bool = False, days: int = 3) -> Dict[str, Any]:
-    """Ottiene i dati meteo per una località (predefinita o dinamica) con fuso orario locale esatto."""
+    """Ottiene i dati meteo per una località con supporto degradazione modelli e fallback resiliente su cache."""
     loc_info = resolve_location(target)
 
     cache_key = f"meteo_{loc_info['lat']:.4f}_{loc_info['lon']:.4f}_{days}"
@@ -368,7 +419,17 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
         if cached:
             return cached
 
-    raw_data = fetch_weather_data(lat=loc_info["lat"], lon=loc_info["lon"], forecast_days=days)
+    try:
+        raw_data = fetch_weather_data(lat=loc_info["lat"], lon=loc_info["lon"], forecast_days=days)
+    except Exception as e:
+        # Se tutte le chiamate API falliscono (es. 429 persistente), tenta fallback su cache last-known-good
+        fallback_data = cache_store.get_last_known_good(cache_key)
+        if fallback_data:
+            print(f"[!] Chiamata live fallita ({e}). Fallback su ultima cache valida.", file=sys.stderr)
+            fallback_data["is_stale_fallback"] = True
+            return fallback_data
+        raise e
+
     metrics = extract_city_metrics(raw_data)
 
     # Calcolo esatto dell'orario locale italiano (indipendentemente dal server cloud che gira in UTC)
@@ -378,6 +439,10 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
 
     hourly = raw_data.get("hourly", {})
     times = hourly.get("time", [])
+
+    # Rileva quali modelli sono presenti nei dati
+    active_keys = [m for m in MODELS.keys() if f"temperature_2m_{m}" in hourly]
+    is_single_best_match = len(active_keys) == 0 and "temperature_2m" in hourly
 
     daily_stats: Dict[str, Any] = {}
     hours_list: List[Dict[str, Any]] = []
@@ -399,7 +464,7 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
                 "total_mm_avg": 0.0,
                 "max_prob": 0.0,
                 "rain_slots": [],
-                "model_totals": {k: 0.0 for k in MODELS.keys()}
+                "model_totals": {k: 0.0 for k in (active_keys if active_keys else ["best_match"])}
             }
 
         precip_vals = []
@@ -411,27 +476,46 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
         wmo_vals = []
         model_temps = {}
 
-        for m_key in MODELS.keys():
-            p = hourly.get(f"precipitation_{m_key}", [0])[i]
-            pr = hourly.get(f"precipitation_probability_{m_key}", [0])[i]
-            t = hourly.get(f"temperature_2m_{m_key}", [0])[i]
-            rh = hourly.get(f"relative_humidity_2m_{m_key}", [0])[i]
-            ws = hourly.get(f"wind_speed_10m_{m_key}", [0])[i]
-            wd = hourly.get(f"wind_direction_10m_{m_key}", [0])[i]
-            wmo = hourly.get(f"weather_code_{m_key}", [0])[i]
+        if is_single_best_match:
+            p = safe_float(hourly.get("precipitation", [0])[i])
+            pr = safe_float(hourly.get("precipitation_probability", [0])[i])
+            t = safe_float(hourly.get("temperature_2m", [0])[i])
+            rh = safe_float(hourly.get("relative_humidity_2m", [50])[i], 50.0)
+            ws = safe_float(hourly.get("wind_speed_10m", [0])[i])
+            wd = safe_float(hourly.get("wind_direction_10m", [0])[i])
+            wmo = int(hourly.get("weather_code", [0])[i] or 0)
 
-            if p is not None: precip_vals.append(float(p))
-            if pr is not None: prob_vals.append(float(pr))
-            if t is not None:
-                temp_vals.append(float(t))
-                model_temps[m_key] = float(t)
-            if rh is not None: rh_vals.append(float(rh))
-            if ws is not None: wind_spd_vals.append(float(ws))
-            if wd is not None: wind_dir_vals.append(float(wd))
-            if wmo is not None: wmo_vals.append(int(wmo))
+            precip_vals.append(p)
+            prob_vals.append(pr)
+            temp_vals.append(t)
+            model_temps["best_match"] = t
+            rh_vals.append(rh)
+            wind_spd_vals.append(ws)
+            wind_dir_vals.append(wd)
+            wmo_vals.append(wmo)
+            daily_stats[day_str]["model_totals"]["best_match"] += p
+        else:
+            for m_key in active_keys:
+                p = hourly.get(f"precipitation_{m_key}", [0])[i]
+                pr = hourly.get(f"precipitation_probability_{m_key}", [0])[i]
+                t = hourly.get(f"temperature_2m_{m_key}", [0])[i]
+                rh = hourly.get(f"relative_humidity_2m_{m_key}", [0])[i]
+                ws = hourly.get(f"wind_speed_10m_{m_key}", [0])[i]
+                wd = hourly.get(f"wind_direction_10m_{m_key}", [0])[i]
+                wmo = hourly.get(f"weather_code_{m_key}", [0])[i]
 
-            if p is not None:
-                daily_stats[day_str]["model_totals"][m_key] += float(p)
+                if p is not None: precip_vals.append(float(p))
+                if pr is not None: prob_vals.append(float(pr))
+                if t is not None:
+                    temp_vals.append(float(t))
+                    model_temps[m_key] = float(t)
+                if rh is not None: rh_vals.append(float(rh))
+                if ws is not None: wind_spd_vals.append(float(ws))
+                if wd is not None: wind_dir_vals.append(float(wd))
+                if wmo is not None: wmo_vals.append(int(wmo))
+
+                if p is not None:
+                    daily_stats[day_str]["model_totals"][m_key] += float(p)
 
         avg_p = sum(precip_vals) / len(precip_vals) if precip_vals else 0.0
         avg_prob = sum(prob_vals) / len(prob_vals) if prob_vals else 0.0
@@ -484,6 +568,9 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
         "metrics": metrics,
         "daily": daily_stats,
         "hours": hours_list,
+        "active_models": active_keys if active_keys else ["best_match"],
+        "model_count": len(active_keys) if active_keys else 1,
+        "is_stale_fallback": False,
         "local_now": local_now,
         "updated_at": local_now.strftime("%d/%m/%Y alle %H:%M:%S")
     }
@@ -531,7 +618,10 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
 
     # Dettaglio modelli
     m_temps = closest_slot.get("model_temps", {})
-    m_temp_str = " • ".join([f"{MODELS[k]}: <code>{m_temps[k]:.1f}°C</code>" for k in MODELS.keys() if k in m_temps])
+    if "best_match" in m_temps:
+        m_temp_str = f"Open-Meteo Best Match: <code>{m_temps['best_match']:.1f}°C</code>"
+    else:
+        m_temp_str = " • ".join([f"{MODELS[k]}: <code>{m_temps[k]:.1f}°C</code>" for k in MODELS.keys() if k in m_temps])
 
     # Trend prossime 3 ore
     cur_idx = hours.index(closest_slot)
@@ -541,6 +631,8 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
         trend_lines.append(f"• <b>{s['hour']}</b>: {s['wmo_icon']} <code>{s['temp']:.1f}°C</code> | Tw <code>{s['wet_bulb']:.1f}°C</code> | 🌧️ {s['rain_mm']:.1f}mm ({s['rain_prob']:.0f}%)")
     trend_text = "\n".join(trend_lines) if trend_lines else "Nessuna proiezione oraria successiva."
 
+    model_count_str = f"Media {len(data.get('active_models', []))} Modelli" if "best_match" not in data.get("active_models", []) else "Modello Singolo Ottimizzato"
+
     out = [
         "🌡️ <b>METEO IN TEMPO REALE</b>",
         f"🏙️ <b>{loc['name'].upper()}</b>",
@@ -548,18 +640,22 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
         f"⏱️ <i>Fascia oraria attiva: {closest_slot['day']} ore {closest_slot['hour']}</i>",
         "━━━━━━━━━━━━━━━━━━━━",
         f"{cur_icon} <b>Condizione:</b> {cur_label}",
-        f"🌡️ <b>Temperatura Live:</b> <code>{cur_t:.1f}°C</code> (Media 5 Modelli)",
+        f"🌡️ <b>Temperatura Live:</b> <code>{cur_t:.1f}°C</code> ({model_count_str})",
         f"💧 <b>Bulbo Umido (Wet Bulb):</b> <code>{cur_wb:.1f}°C</code>\n   └ Indice stress: <i>{stress_badge}</i>",
         f"💦 <b>Umidità Relativa:</b> <code>{cur_rh:.0f}%</code>",
         f"💨 <b>Vento:</b> <code>{cur_ws:.1f} km/h</code> da <code>{cur_wd}</code>",
         f"🌧️ <b>Precipitazione oraria:</b> <code>{cur_rain:.2f} mm</code> (Prob. <code>{cur_prob:.0f}%</code>)\n",
-        "🔬 <b>CONFRONTO MODELLI ADESSO:</b>",
+        "🔬 <b>CONFRONTO MODELLI ATTIVI:</b>",
         f"{m_temp_str}\n",
         "🕒 <b>TENDENZA PROSSIME 3 ORE:</b>",
         trend_text,
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 <i>Rilevamento delle {updated_at} • Ensemble Open-Meteo</i>"
+        "━━━━━━━━━━━━━━━━━━━━"
     ]
+
+    if data.get("is_stale_fallback"):
+        out.append(f"⚠️ <i>Dati in cache ({updated_at}) • Modalità Risparmio API attiva</i>")
+    else:
+        out.append(f"🕒 <i>Rilevamento delle {updated_at} • Ensemble Open-Meteo</i>")
 
     return "\n".join(out)
 
@@ -568,12 +664,18 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
     loc = data["loc"]
     daily = data["daily"]
     updated_at = data.get("updated_at", "")
+    active_m = data.get("active_models", list(MODELS.keys()))
+
+    if "best_match" in active_m:
+        m_head_str = "Modello Singolo Ottimizzato (Best Match)"
+    else:
+        m_head_str = f"{len(active_m)} Modelli: " + ", ".join([MODELS.get(k, k) for k in active_m])
 
     header = [
         f"📍 <b>PREVISIONI METEO ENSEMBLE (3 GIORNI)</b>",
         f"🏙️ <b>{loc['name'].upper()}</b>",
         f"🧭 <i>{loc.get('desc', loc.get('region', ''))}</i>",
-        f"🔬 <i>5 Modelli: ECMWF, ICON, M-France, GFS, JMA</i>",
+        f"🔬 <i>{m_head_str}</i>",
         "━━━━━━━━━━━━━━━━━━━━"
     ]
 
@@ -598,7 +700,10 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
         ]
 
         # Dettaglio modelli
-        model_str = " • ".join([f"{MODELS[k]}: <code>{stats['model_totals'][k]:.1f}mm</code>" for k in MODELS.keys()])
+        if "best_match" in stats["model_totals"]:
+            model_str = f"Best Match: <code>{stats['model_totals']['best_match']:.1f}mm</code>"
+        else:
+            model_str = " • ".join([f"{MODELS[k]}: <code>{stats['model_totals'][k]:.1f}mm</code>" for k in active_m if k in stats["model_totals"]])
         day_block.append(f"   ↳ <i>Modelli:</i> {model_str}")
 
         # Finestre di pioggia
@@ -618,7 +723,7 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
 
     footer = [
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 <i>Aggiornato alle {updated_at} • Dati Open-Meteo</i>"
+        f"⚠️ <i>Dati in cache ({updated_at}) • Risparmio API attivo</i>" if data.get("is_stale_fallback") else f"🕒 <i>Aggiornato alle {updated_at} • Dati Open-Meteo</i>"
     ]
 
     return "\n\n".join(["\n".join(header), "\n\n".join(body), "\n".join(footer)])
@@ -1072,7 +1177,8 @@ class RainAlertMonitor:
             points = self.bot_runner.get_user_alert_points(chat_id)
             for idx, loc in enumerate(points):
                 try:
-                    data = parse_location_forecast(loc, force_refresh=True, days=1)
+                    # Usa la cache se recente invece di forzare chiamate esterne
+                    data = parse_location_forecast(loc, force_refresh=False, days=1)
                     hours = data.get("hours", [])
                     local_now = data.get("local_now", datetime.now())
 
@@ -1091,6 +1197,7 @@ class RainAlertMonitor:
                                 break
                 except Exception as e:
                     print(f"[!] Errore controllo pioggia per chat {chat_id}, punto {idx+1}: {e}", file=sys.stderr)
+                time.sleep(1.5)  # Distanziamento anti-burst tra i punti
 
     def send_rain_notification(self, chat_id: int, point_num: int, loc: Dict[str, Any], slot: Dict[str, Any]) -> None:
         msg = [
