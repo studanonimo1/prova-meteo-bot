@@ -6,7 +6,18 @@ echo ===================================================
 echo.
 cd /d "%~dp0"
 
-echo Verifica e invio commit...
+echo Verifica modifiche locali...
+git add .
+git diff --cached --quiet
+if %ERRORLEVEL% neq 0 (
+    echo Creo il commit con le modifiche rilevate...
+    git commit -m "Aggiornamento bot meteo %date% %time%"
+) else (
+    echo Nessuna nuova modifica da committare.
+)
+
+echo.
+echo Invio a GitHub in corso...
 git push origin main
 
 if %ERRORLEVEL% equ 0 (
@@ -18,7 +29,7 @@ if %ERRORLEVEL% equ 0 (
 ) else (
     echo.
     echo ===================================================
-    echo   [ATTENZIONE] Si e' verificato un problema.
+    echo   [ATTENZIONE] Si e' verificato un problema con il push.
     echo ===================================================
 )
 
