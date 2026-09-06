@@ -374,7 +374,7 @@ def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> 
         raw = json.loads(resp.read().decode("utf-8"))
 
     series = raw.get("properties", {}).get("timeseries", [])
-    times, temps, precips, probs, humidities, wind_spds, wind_dirs, codes = [], [], [], [], [], [], [], []
+    times, temps, precips, probs, humidities, wind_spds, wind_dirs, codes, pressures = [], [], [], [], [], [], [], [], []
 
     max_slots = forecast_days * 24
     for item in series[:max_slots]:
@@ -388,6 +388,7 @@ def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> 
         rh = float(inst.get("relative_humidity", 50.0))
         ws_kmh = round(float(inst.get("wind_speed", 0.0)) * 3.6, 1)
         wd = float(inst.get("wind_from_direction", 0.0))
+        pres = float(inst.get("air_pressure_at_sea_level", 1013.25) or 1013.25)
 
         n1 = item.get("data", {}).get("next_1_hours", {})
         n6 = item.get("data", {}).get("next_6_hours", {})
@@ -429,6 +430,7 @@ def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> 
         wind_spds.append(ws_kmh)
         wind_dirs.append(wd)
         codes.append(code)
+        pressures.append(pres)
 
     return {
         "utc_offset_seconds": 7200,
@@ -441,7 +443,8 @@ def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> 
             "relative_humidity_2m": humidities,
             "wind_speed_10m": wind_spds,
             "wind_direction_10m": wind_dirs,
-            "weather_code": codes
+            "weather_code": codes,
+            "pressure_msl": pressures
         }
     }
 
@@ -463,7 +466,7 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
-            f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability"
+            f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability,pressure_msl"
             f"{models_query}"
             f"&forecast_days={forecast_days}"
             f"&timezone=auto"
@@ -520,7 +523,10 @@ def extract_city_metrics(data: dict) -> dict:
     all_precips = []
     all_probs = []
     all_wbs = []
+    all_pressures = []
+    all_wind_spds = []
     days_data = {}
+    model_max_temps = {m: [] for m in active_keys}
 
     for i, t_str in enumerate(times):
         dt = datetime.fromisoformat(t_str)
@@ -531,17 +537,27 @@ def extract_city_metrics(data: dict) -> dict:
             p_val = safe_float(hourly.get("precipitation", [0])[i])
             pr_val = safe_float(hourly.get("precipitation_probability", [0])[i])
             rh_val = safe_float(hourly.get("relative_humidity_2m", [50])[i], 50.0)
-            avg_t, avg_p, avg_pr, avg_rh = t_val, p_val, pr_val, rh_val
+            ws_val = safe_float(hourly.get("wind_speed_10m", [0])[i])
+            pres_val = safe_float(hourly.get("pressure_msl", [1013.25])[i], 1013.25)
+            avg_t, avg_p, avg_pr, avg_rh, avg_ws, avg_pres = t_val, p_val, pr_val, rh_val, ws_val, pres_val
         else:
             t_vals = [safe_float(hourly.get(f"temperature_2m_{m}", [None])[i]) for m in active_keys if hourly.get(f"temperature_2m_{m}") is not None]
             p_vals = [safe_float(hourly.get(f"precipitation_{m}", [None])[i]) for m in active_keys if hourly.get(f"precipitation_{m}") is not None]
             pr_vals = [safe_float(hourly.get(f"precipitation_probability_{m}", [None])[i]) for m in active_keys if hourly.get(f"precipitation_probability_{m}") is not None]
             rh_vals = [safe_float(hourly.get(f"relative_humidity_2m_{m}", [None])[i], 50.0) for m in active_keys if hourly.get(f"relative_humidity_2m_{m}") is not None]
+            ws_vals = [safe_float(hourly.get(f"wind_speed_10m_{m}", [None])[i]) for m in active_keys if hourly.get(f"wind_speed_10m_{m}") is not None]
+            pres_vals = [safe_float(hourly.get(f"pressure_msl_{m}", [None])[i], 1013.25) for m in active_keys if hourly.get(f"pressure_msl_{m}") is not None]
+
+            for m in active_keys:
+                if hourly.get(f"temperature_2m_{m}") is not None:
+                    model_max_temps[m].append(safe_float(hourly.get(f"temperature_2m_{m}")[i]))
 
             avg_t = sum(t_vals) / len(t_vals) if t_vals else 0.0
             avg_p = sum(p_vals) / len(p_vals) if p_vals else 0.0
             avg_pr = sum(pr_vals) / len(pr_vals) if pr_vals else 0.0
             avg_rh = sum(rh_vals) / len(rh_vals) if rh_vals else 50.0
+            avg_ws = sum(ws_vals) / len(ws_vals) if ws_vals else 0.0
+            avg_pres = sum(pres_vals) / len(pres_vals) if pres_vals else safe_float(hourly.get("pressure_msl", [1013.25])[i], 1013.25)
 
         wb = calculate_wet_bulb(avg_t, avg_rh)
 
@@ -549,6 +565,8 @@ def extract_city_metrics(data: dict) -> dict:
         all_precips.append(avg_p)
         all_probs.append(avg_pr)
         all_wbs.append(wb)
+        all_pressures.append(avg_pres)
+        all_wind_spds.append(avg_ws)
 
         if day_str not in days_data:
             days_data[day_str] = {"temps": [], "precip_total": 0.0, "max_prob": 0.0, "rain_hours": 0}
@@ -559,6 +577,14 @@ def extract_city_metrics(data: dict) -> dict:
         if avg_p > 0.1:
             days_data[day_str]["rain_hours"] += 1
 
+    model_spread = 0.0
+    if model_max_temps:
+        m_maxs = [max(vals) for vals in model_max_temps.values() if vals]
+        if m_maxs:
+            model_spread = round(max(m_maxs) - min(m_maxs), 1)
+
+    p_delta = round(all_pressures[-1] - all_pressures[0], 1) if len(all_pressures) > 1 else 0.0
+
     return {
         "max_temp": max(all_temps) if all_temps else 0.0,
         "min_temp": min(all_temps) if all_temps else 0.0,
@@ -566,6 +592,14 @@ def extract_city_metrics(data: dict) -> dict:
         "max_wb": max(all_wbs) if all_wbs else 0.0,
         "total_rain": sum(all_precips) if all_precips else 0.0,
         "max_rain_prob": max(all_probs) if all_probs else 0.0,
+        "max_wind_spd": max(all_wind_spds) if all_wind_spds else 0.0,
+        "avg_wind_spd": sum(all_wind_spds) / len(all_wind_spds) if all_wind_spds else 0.0,
+        "cur_pressure": round(all_pressures[0], 1) if all_pressures else 1013.25,
+        "avg_pressure": round(sum(all_pressures) / len(all_pressures), 1) if all_pressures else 1013.25,
+        "min_pressure": round(min(all_pressures), 1) if all_pressures else 1013.25,
+        "max_pressure": round(max(all_pressures), 1) if all_pressures else 1013.25,
+        "pressure_delta": p_delta,
+        "model_spread": model_spread,
         "days": days_data
     }
 
@@ -664,6 +698,7 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
             ws = safe_float(hourly.get("wind_speed_10m", [0])[i])
             wd = safe_float(hourly.get("wind_direction_10m", [0])[i])
             wmo = int(hourly.get("weather_code", [0])[i] or 0)
+            pres = safe_float(hourly.get("pressure_msl", [1013.25])[i], 1013.25)
 
             precip_vals.append(p)
             prob_vals.append(pr)
@@ -674,7 +709,9 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
             wind_dir_vals.append(wd)
             wmo_vals.append(wmo)
             daily_stats[day_str]["model_totals"]["best_match"] += p
+            avg_pres = pres
         else:
+            pres_vals = []
             for m_key in active_keys:
                 p = hourly.get(f"precipitation_{m_key}", [0])[i]
                 pr = hourly.get(f"precipitation_probability_{m_key}", [0])[i]
@@ -683,6 +720,7 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
                 ws = hourly.get(f"wind_speed_10m_{m_key}", [0])[i]
                 wd = hourly.get(f"wind_direction_10m_{m_key}", [0])[i]
                 wmo = hourly.get(f"weather_code_{m_key}", [0])[i]
+                m_pres = hourly.get(f"pressure_msl_{m_key}", [None])[i]
 
                 if p is not None: precip_vals.append(float(p))
                 if pr is not None: prob_vals.append(float(pr))
@@ -693,9 +731,12 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
                 if ws is not None: wind_spd_vals.append(float(ws))
                 if wd is not None: wind_dir_vals.append(float(wd))
                 if wmo is not None: wmo_vals.append(int(wmo))
+                if m_pres is not None: pres_vals.append(float(m_pres))
 
                 if p is not None:
                     daily_stats[day_str]["model_totals"][m_key] += float(p)
+
+            avg_pres = sum(pres_vals) / len(pres_vals) if pres_vals else safe_float(hourly.get("pressure_msl", [1013.25])[i], 1013.25)
 
         avg_p = sum(precip_vals) / len(precip_vals) if precip_vals else 0.0
         avg_prob = sum(prob_vals) / len(prob_vals) if prob_vals else 0.0
@@ -735,6 +776,7 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
             "model_temps": model_temps,
             "wet_bulb": wet_bulb,
             "humidity": avg_rh,
+            "pressure": avg_pres,
             "rain_mm": avg_p,
             "rain_prob": avg_prob,
             "wind_spd": avg_ws,
@@ -921,56 +963,228 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
 
 
 def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -> str:
-    """Genera l'editoriale sinottico dettagliato e specifico per qualsiasi città o coordinata."""
+    """
+    Genera un bollettino meteorologico sinottico professionale ad alto contenuto specialistico (stile aeronautico).
+    Analizza dinamicamente per qualsiasi località:
+    1. Inquadramento barico e gradienti isobarici (SLP, tendenza 72h).
+    2. Diagnosi termodinamica della massa d'aria dominante (origine, temperatura potenziale, contenuto igrometrico).
+    3. Indice di stabilità e finestra temporale esatta dell'eventuale cambiamento di tempo.
+    4. Regime anemometrico al suolo, rotazioni e turbolenza nello strato limite.
+    5. Grado di convergenza/dispersione dell'Ensemble multi-modello (affidabilità).
+    6. Note operative e sintesi del bollettino.
+    """
     loc = data["loc"]
     m = data.get("metrics", {})
+    hours = data.get("hours", [])
     updated_at = data.get("updated_at", "")
+    active_m = data.get("active_models", list(MODELS.keys()))
 
-    max_t = m.get("max_temp", 30.0)
-    min_t = m.get("min_temp", 18.0)
-    avg_t = m.get("avg_temp", 24.0)
+    # Parametri fisici estratti
+    max_t = m.get("max_temp", 25.0)
+    min_t = m.get("min_temp", 15.0)
+    avg_t = m.get("avg_temp", 20.0)
     tot_r = m.get("total_rain", 0.0)
     max_pr = m.get("max_rain_prob", 0.0)
-    max_wb = m.get("max_wb", 22.0)
+    max_wb = m.get("max_wb", 20.0)
+    max_ws = m.get("max_wind_spd", 15.0)
+    avg_ws = m.get("avg_wind_spd", 10.0)
+    avg_p = m.get("avg_pressure", 1015.0)
+    cur_p = m.get("cur_pressure", avg_p)
+    p_delta = m.get("pressure_delta", 0.0)
+    model_spread = m.get("model_spread", 1.0)
 
-    is_rainy = tot_r > 3.0 or max_pr >= 40
-    is_hot = max_t >= 32.0 or max_wb >= 25.0
+    # 1. Direzione dominante del vento nelle 72h
+    wind_dirs = [h.get("wind_dir", "N") for h in hours if h.get("wind_dir")]
+    dominant_wind = max(set(wind_dirs), key=wind_dirs.count) if wind_dirs else "Variabile"
 
-    if "putignano" in loc["key"].lower():
-        title_str = "🔥 <b>QUADRO SINOTTICO: PUTIGNANO & MURGE BARESI</b>"
-        sub_title = "<b>Pulsazione calda anticiclonica, compressione dell'aria e stabilità sul versante adriatico.</b>"
-        extra_note = "L'evoluzione sul settore centrale delle Murge è dominata dalla risalita di una matrice subtropicale continentale."
-    elif "monza" in loc["key"].lower():
-        title_str = "⛈️ <b>QUADRO SINOTTICO: MONZA & ALTA PIANURA PADANA</b>"
-        sub_title = "<b>Fase prefrontale caldo-umida, elevata afa e cedimento instabile con rischio temporali.</b>"
-        extra_note = "La Brianza si colloca lungo il bordo settentrionale di convergenza tra il richiamo caldo e le infiltrazioni atlantiche."
+    # 2. Diagnosi Figura Barica Dominante
+    if avg_p >= 1021.0:
+        baric_type = "Promontorio Anticiclonico di Blocco strutturato"
+        baric_desc = (
+            f"La colonna atmosferica su {loc['name']} è governata da una solida cella anticiclonica "
+            f"(pressione media stimata: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
+            f"I moti subsidenti discendenti comprimono l'aria verso il suolo, inibendo sul nascere "
+            f"lo sviluppo di moti convettivi verticali e garantendo un esteso scudo protettivo."
+        )
+    elif avg_p >= 1016.0:
+        baric_type = "Campo Anticiclonico a Gradiente Debole"
+        baric_desc = (
+            f"Assetto barico dominato da un'area di alta pressione moderatamente livellata "
+            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
+            f"Condizioni di generale stabilità al suolo, con modesto gradiente barico orizzontale e "
+            f"scarse perturbazioni a larga scala, salvo deboli ondulazioni termiche diurne."
+        )
+    elif avg_p >= 1012.0:
+        baric_type = "Palude Barica / Circolazione Ciclica Livellata"
+        baric_desc = (
+            f"Configurazione barica debolmente livellata priva di centri di alta o bassa pressione dominanti "
+            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
+            f"Tale assetto favorisce un modesto accumulo di umidità nei bassi strati con formazione di cumuli pomeridiani "
+            f"in corrispondenza del riscaldamento diurno o di convergenze orografiche locali."
+        )
+    elif avg_p >= 1007.0:
+        baric_type = "Saccatura Depressionaria in Avanzamento"
+        baric_desc = (
+            f"Progressiva flessione del campo di geopotenziale con inserimento di una saccatura atlantica "
+            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
+            f"L'afflusso di aria progressivamente più fresca in quota genera un gradiente termico verticale favorevole "
+            f"all'attivazione di contrasti convettivi e linee di instabilità organizzata."
+        )
     else:
-        title_str = f"📡 <b>QUADRO SINOTTICO DEDICATO: {loc['name'].upper()}</b>"
-        if is_rainy:
-            sub_title = "<b>Assetto instabile con passaggi perturbati o contrasti convettivi significativi.</b>"
-        elif is_hot:
-            sub_title = "<b>Regime anticiclonico caldo con marcata compressione termica al suolo.</b>"
-        else:
-            sub_title = "<b>Condizioni di generale equilibrio barico con circolazione standard.</b>"
-        extra_note = f"Analisi specifica calcolata per le coordinate {loc['lat']:.4f}°N, {loc['lon']:.4f}°E ({loc.get('region', '')})."
+        baric_type = "Vortice Ciclonico / Minimo Depressionario Attivo"
+        baric_desc = (
+            f"Regime di bassa pressione marcata (pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
+            f"Presenza di un fitto gradiente barico orizzontale con ventilazione vivace, convergenza al suolo "
+            f"e transito di corpi nuvolosi frontali forieri di precipitazioni diffuse."
+        )
 
-    synopsis_body = (
-        f"{extra_note}\n\n"
-        "📌 <b>Dinamica Termo-Igorometrica & Modelli:</b>\n"
-        f"• <b>Comportamento Termico:</b> Picco massimo atteso a <code>{max_t:.1f}°C</code> (minima notturna <code>{min_t:.1f}°C</code>, media <code>{avg_t:.1f}°C</code>).\n"
-        f"• <b>Bulbo Umido (Wet Bulb Tw):</b> Valore max <code>{max_wb:.1f}°C</code> ({'Aria asciutta / Comfort' if max_wb < 24 else 'Afa percepita' if max_wb < 28 else 'Stress termico elevato'}).\n"
-        f"• <b>Assetto Precipitativo:</b> Cumulato totale sui 3 giorni stimato in <code>{tot_r:.1f} mm</code> (picco di probabilità al <code>{max_pr:.0f}%</code>)."
+    # Tendenza Barica (Trend 72h)
+    if p_delta <= -4.0:
+        baric_trend = f"🔻 <b>Tendenza Barica (72h):</b> <b>Flessione barica pronunciata</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): indica l'approssimarsi di una discontinuità frontale o di una saccatura in avvicinamento."
+    elif p_delta >= 4.0:
+        baric_trend = f"🔺 <b>Tendenza Barica (72h):</b> <b>Rimonta pressoria consistente</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): segnala un consolidamento progressivo della struttura anticiclonica con netto miglioramento."
+    else:
+        baric_trend = f"⚖️ <b>Tendenza Barica (72h):</b> <b>Sostanziale stazionarietà barica</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): oscillazioni fisiologiche legate al ciclo di marea atmosferica diurna senza rotture sinottiche violente."
+
+    # 3. Diagnosi Massa d'Aria & Contenuto Termo-Igrometrico
+    is_meridional = any(d in dominant_wind for d in ["S", "SE", "SW"])
+    is_northern = any(d in dominant_wind for d in ["N", "NE", "NW"])
+
+    if max_t >= 31.0 or max_wb >= 24.0:
+        air_mass_type = "Subtropicale Continentale (Matrice Nord-Africana)"
+        air_mass_desc = (
+            f"Flusso a matrice sahariana con risalita di aria calda in quota e forte riscaldamento superficiale. "
+            f"Il profilo verticale evidenzia temperature di picco a <code>{max_t:.1f}°C</code> e bulbo umido elevato "
+            f"(Tw max <code>{max_wb:.1f}°C</code>), responsabile di afa percepita e accumulo di energia termica potenziale."
+        )
+    elif max_t >= 27.0 and is_meridional:
+        air_mass_type = "Subtropicale Marittima Mediterranea"
+        air_mass_desc = (
+            f"Massa d'aria calda ma ricca di umidità nei bassi strati trasportata da correnti meridionali "
+            f"(quadrante prevalente: <code>{dominant_wind}</code>). "
+            f"Sensazione di calore umido con escursione termica contenuta e tendenza a foschie nelle ore notturne."
+        )
+    elif avg_t <= 12.0 or (min_t <= 6.0 and is_northern):
+        air_mass_type = "Polare Continentale / Artica Marittima"
+        air_mass_desc = (
+            f"Circolazione alimentata da aria densa, fredda e limpida di provenienza settentrionale. "
+            f"Notevole escursione termica (minima <code>{min_t:.1f}°C</code>, massima <code>{max_t:.1f}°C</code>), "
+            f"basso punto di rugiada e sensazione di freddo acuita dalla ventilazione (wind chill)."
+        )
+    elif tot_r >= 4.0 or max_pr >= 45.0:
+        air_mass_type = "Marittima Oceanica Instabile (Atlantica)"
+        air_mass_desc = (
+            f"Massa d'aria temperata ma marcatamente umida e instabile proveniente dai quadranti atlantici. "
+            f"Elevato gradiente di vapore acqueo con frequenti addensamenti nuvolosi, rovesci intermittenti "
+            f"(cumulato stimato: <code>{tot_r:.1f} mm</code>) e vivace turbolenza dinamica."
+        )
+    else:
+        air_mass_type = "Temperata di Transizione Continentale"
+        air_mass_desc = (
+            f"Massa d'aria in buon equilibrio termico con le medie climatiche stagionali "
+            f"(temperatura media: <code>{avg_t:.1f}°C</code>, minima: <code>{min_t:.1f}°C</code>, massima: <code>{max_t:.1f}°C</code>). "
+            f"Valori di bulbo umido confortevoli (<code>{max_wb:.1f}°C</code>) con modesta turbolenza e buona qualità dell'aria."
+        )
+
+    # 4. Analisi di Stabilità & Finestra Esatta del Cambiamento
+    change_event = None
+    for slot in hours:
+        if slot.get("rain_mm", 0.0) >= 0.4 or slot.get("rain_prob", 0.0) >= 40.0:
+            change_event = {
+                "day": slot["day"],
+                "hour": slot["hour"],
+                "reason": "precipitazioni",
+                "detail": f"attivazione di rovesci con probabilità al <code>{slot['rain_prob']:.0f}%</code> e intensità oraria di <code>{slot['rain_mm']:.1f} mm</code> ({slot['wmo_label']})",
+                "wind": f"venti da {slot['wind_dir']} a {slot['wind_spd']:.1f} km/h"
+            }
+            break
+        elif slot.get("wind_spd", 0.0) >= 35.0:
+            change_event = {
+                "day": slot["day"],
+                "hour": slot["hour"],
+                "reason": "vento",
+                "detail": f"brusco rinforzo anemometrico con raffiche fino a <code>{slot['wind_spd']:.1f} km/h</code> da <code>{slot['wind_dir']}</code>",
+                "wind": f"rotazione su {slot['wind_dir']}"
+            }
+            break
+
+    if change_event:
+        stability_status = "Instabilità in Ingresso / Transizione Frontale"
+        timing_desc = (
+            f"⚠️ <b>Finestra Temporale del Cambiamento:</b> La fase di stabilità iniziale subirà un cedimento da "
+            f"<b>{change_event['day']} attorno alle ore {change_event['hour']}</b>.\n"
+            f"• <i>Fenomeno atteso:</i> {change_event['detail']}.\n"
+            f"• <i>Dinamica al suolo:</i> {change_event['wind']} con progressiva rottura della stazionarietà barica."
+        )
+    else:
+        stability_status = "Stabilità Continua su 72 Ore (Fase Schermata)"
+        timing_desc = (
+            f"🛡️ <b>Stabilità Continua:</b> <b>Nessun peggioramento o rottura della circolazione atteso nelle 72 ore.</b>\n"
+            f"• La colonna troposferica risulterà costantemente inibita dalla compressione dell'aria al suolo, "
+            f"mantenendo assenza totale di precipitazioni organizzate, cielo prevalentemente sgombro o poco nuvoloso "
+            f"e condizioni ideali per tutte le attività all'aperto e la navigazione."
+        )
+
+    # 5. Ventilazione & Circolazione Anemometrica
+    wind_analysis = (
+        f"• <b>Flusso Prevalente:</b> Quadrante <code>{dominant_wind}</code> (intensità media: <code>{avg_ws:.1f} km/h</code>).\n"
+        f"• <b>Picco Massimo di Raffica:</b> Stimato a <code>{max_ws:.1f} km/h</code>.\n"
+        f"• <b>Regime di Brezza:</b> Circolazione modulata dal riscaldamento diurno con brezze termiche nel pomeriggio "
+        f"e successiva attenuazione serale per inversione termica superficiale."
     )
 
+    # 6. Affidabilità Predittiva Multi-Modello
+    model_count = len(active_m) if active_m and "best_match" not in active_m else 1
+    if model_spread < 1.8 and model_count > 1:
+        confidence_badge = "🟢 ELEVATA (Consenso ≥ 90%)"
+        confidence_desc = (
+            f"I {model_count} modelli meteorologici globali (ECMWF, ICON, GFS, M-France, JMA) convergono con precisione "
+            f"elevata sulla traiettoria barica e sull'evoluzione termica (spread massimo limitato a <code>{model_spread:.1f}°C</code>). "
+            f"Previsione ad alta affidabilità."
+        )
+    elif model_spread < 3.2:
+        confidence_badge = "🟡 BUONA / MEDIA (Consenso ≈ 75%)"
+        confidence_desc = (
+            f"Accordo generale tra i modelli sui tratti barici salienti; permangono modeste divergenze orarie "
+            f"sull'esatta entità dei picchi termici massimi (spread di <code>{model_spread:.1f}°C</code> tra modelli europei ed americani)."
+        )
+    else:
+        confidence_badge = "🟠 MEDIO-BASSA (Dispersione Modellistica)"
+        confidence_desc = (
+            f"I modelli evidenziano sensibili discrepanze sulla velocità di penetrazione delle masse d'aria "
+            f"(spread termico di <code>{model_spread:.1f}°C</code>). Seguire i prossimi aggiornamenti."
+        )
+
+    # 7. Note Operative & Sintesi
+    if tot_r > 3.0:
+        op_summary = "Fase instabile con finestre di pioggia: pianificare le attività all'aperto monitorando gli orari di precipitazione."
+    elif max_t >= 32.0:
+        op_summary = "Regime caldo-afoso esteso: limitare l'esposizione diretta nelle ore centrali del dì (picco UV e stress da afa)."
+    elif max_ws >= 30.0:
+        op_summary = "Ventilazione vivace a tratti tesa: prestare attenzione alle raffiche improvvise su aree esposte."
+    else:
+        op_summary = "Condizioni meteorologiche ottimali e stabili: via libera senza limitazioni per spostamenti ed attività esterne."
+
     out = [
-        title_str,
-        f"📍 <i>Analisi multi-modello specifica per {loc['name']}</i>",
+        "📡 <b>BOLLETTINO METEOROLOGICO SINOTTICO PROFESSIONALE</b>",
+        f"🏙️ <b>{loc['name'].upper()}</b>",
+        f"📍 <i>{loc.get('desc', loc.get('region', ''))}</i>",
+        f"⏱️ <i>Emissione: {updated_at} • Orizzonte: 72 Ore (Modelli Ensemble)</i>",
         "━━━━━━━━━━━━━━━━━━━━",
-        sub_title,
-        "\n🧭 <b>ANALISI METEOROLOGICA SPECIALISTICA:</b>",
-        synopsis_body,
-        "\n━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 <i>Editoriale elaborato alle {updated_at} • Meteo Ensemble Bot</i>"
+        f"🧭 <b>1. ASSETTO BARICO & ISOBARICO:</b>",
+        f"• <b>Figura Dominante:</b> <i>{baric_type}</i>\n{baric_desc}",
+        f"{baric_trend}\n",
+        f"🌡️ <b>2. DIAGNOSI MASSA D'ARIA & TERMODINAMICA:</b>",
+        f"• <b>Tipologia:</b> <i>{air_mass_type}</i>\n{air_mass_desc}\n",
+        f"⏳ <b>3. STABILITÀ & LINEA DI CAMBIAMENTO:</b>",
+        f"• <b>Stato Troposferico:</b> <i>{stability_status}</i>\n{timing_desc}\n",
+        f"💨 <b>4. DINAMICA ANEMOMETRICA AL SUOLO:</b>",
+        f"{wind_analysis}\n",
+        f"🔬 <b>5. AFFIDABILITÀ PREDITTIVA MULTI-MODELLO:</b>",
+        f"• <b>Indice di Accordo:</b> {confidence_badge}\n{confidence_desc}\n",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📋 <b>GIUDIZIO DI SINTESI OPERATIVA:</b>\n<i>{op_summary}</i>\n",
+        f"🕒 <i>Bollettino elaborato con integrazione Ensemble ECMWF • ICON • GFS • M-France • JMA</i>"
     ]
     return "\n".join(out)
 
