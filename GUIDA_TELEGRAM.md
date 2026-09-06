@@ -58,7 +58,8 @@ Il bot include un **monitor in background** che controlla ogni 30 minuti l'arriv
 
 ### 🎛️ 3. Navigazione & Schede Interattive
 * `[ 📍 Putignano ]` / `[ 📍 Monza ]` / `[ 📍 Città Attiva ]`
-* `[ 🌡️ Adesso ]`: Temperatura live calcolata su orario locale italiano esatto, Bulbo Umido, umidità, vento e trend 3 ore.
+* `[ 🌡️ Adesso ]`: Temperatura live calcolata su orario locale italiano esatto, orari solari compatti, Bulbo Umido, umidità, vento e trend 3 ore.
+* `[ ☀️ Sole & Crepuscolo ]` o `/sole`: Quadro astronomico NOAA di oggi con alba, tramonto, crepuscolo civile mattutino (prime luci), serale (buio completo), culmine solare e durata del dì.
 * `[ 📅 Previsioni 3gg ]`: Riepilogo giornaliero con confronto modelli e cumulati di pioggia.
 * `[ 📡 Sinottico ]`: Editoriale meteorologico specialistico mirato per la località selezionata.
 * `[ 🌧️ Solo Pioggia ]`: Filtra le sole fasce orarie con precipitazioni.

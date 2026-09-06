@@ -265,6 +265,104 @@ def safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def calculate_sun_times(lat: float, lon: float, date_obj: Optional[Any] = None, tz_offset_hours: float = 2.0) -> Dict[str, str]:
+    """
+    Calcola con formula astronomica NOAA (Zero External Dependencies):
+    - Crepuscolo civile mattutino (Civil Dawn: prime luci, zenit 96.0°)
+    - Alba astronomica (Sunrise: zenit 90.833°)
+    - Mezzogiorno astronomico / Culmine solare (Solar Noon)
+    - Tramonto astronomico (Sunset: zenit 90.833°)
+    - Crepuscolo civile serale (Civil Dusk: buio completo, zenit 96.0°)
+    - Durata del dì (luce solare diretta) e durata della luce utile (con crepuscolo).
+    """
+    if date_obj is None:
+        date_obj = datetime.now().date()
+
+    n = date_obj.timetuple().tm_yday
+    gamma = 2.0 * math.pi / 365.0 * (n - 1)
+
+    # Equazione del tempo (in minuti)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma)
+        - 0.040849 * math.sin(2 * gamma)
+    )
+
+    # Declinazione solare (in radianti)
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2 * gamma)
+        + 0.000907 * math.sin(2 * gamma)
+        - 0.002697 * math.cos(3 * gamma)
+        + 0.00148 * math.sin(3 * gamma)
+    )
+
+    lat_rad = math.radians(lat)
+
+    def get_times_for_zenith(zenith_deg: float) -> Tuple[Optional[float], Optional[float], float]:
+        cos_zen = math.cos(math.radians(zenith_deg))
+        denom = math.cos(lat_rad) * math.cos(decl)
+        noon_utc = 720.0 - 4.0 * lon - eqtime
+        if abs(denom) < 1e-9:
+            return None, None, (noon_utc + tz_offset_hours * 60) % 1440
+        cos_ha = (cos_zen - math.sin(lat_rad) * math.sin(decl)) / denom
+        if cos_ha > 1.0:
+            return None, None, (noon_utc + tz_offset_hours * 60) % 1440
+        if cos_ha < -1.0:
+            return None, None, (noon_utc + tz_offset_hours * 60) % 1440
+
+        ha = math.degrees(math.acos(cos_ha))
+        rise_utc = 720.0 - 4.0 * (lon + ha) - eqtime
+        set_utc = 720.0 - 4.0 * (lon - ha) - eqtime
+        return (
+            (rise_utc + tz_offset_hours * 60) % 1440,
+            (set_utc + tz_offset_hours * 60) % 1440,
+            (noon_utc + tz_offset_hours * 60) % 1440
+        )
+
+    def fmt(mins: Optional[float]) -> str:
+        if mins is None:
+            return "--:--"
+        h = int(mins // 60) % 24
+        m = int(round(mins % 60))
+        if m == 60:
+            h = (h + 1) % 24
+            m = 0
+        return f"{h:02d}:{m:02d}"
+
+    # Crepuscolo civile (zenit 96.0°)
+    c_dawn_min, c_dusk_min, _ = get_times_for_zenith(96.0)
+    # Alba e tramonto solare (zenit 90.833°)
+    s_rise_min, s_set_min, s_noon_min = get_times_for_zenith(90.833)
+
+    if s_rise_min is not None and s_set_min is not None:
+        daylight_mins = (s_set_min - s_rise_min) if s_set_min >= s_rise_min else (1440 - s_rise_min + s_set_min)
+        daylight_str = f"{int(daylight_mins // 60)}h {int(round(daylight_mins % 60))}m"
+    else:
+        daylight_str = "N/D"
+
+    if c_dawn_min is not None and c_dusk_min is not None:
+        twilight_mins = (c_dusk_min - c_dawn_min) if c_dusk_min >= c_dawn_min else (1440 - c_dawn_min + c_dusk_min)
+        twilight_str = f"{int(twilight_mins // 60)}h {int(round(twilight_mins % 60))}m"
+    else:
+        twilight_str = "N/D"
+
+    return {
+        "civil_dawn": fmt(c_dawn_min),
+        "sunrise": fmt(s_rise_min),
+        "solar_noon": fmt(s_noon_min),
+        "sunset": fmt(s_set_min),
+        "civil_dusk": fmt(c_dusk_min),
+        "daylight": daylight_str,
+        "twilight_light": twilight_str
+    }
+
+
+
 def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> dict:
     """Interroga l'API di MET Norway (Locationforecast 2.0 compact) come fallback gratuito, accurato e senza rate-limit."""
     url = f"https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={lat:.4f}&lon={lon:.4f}"
@@ -645,11 +743,19 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
             "wmo_label": wmo_label
         })
 
+    sun_times = calculate_sun_times(
+        lat=loc_info["lat"],
+        lon=loc_info["lon"],
+        date_obj=local_now.date(),
+        tz_offset_hours=offset_seconds / 3600.0
+    )
+
     result_data = {
         "loc": loc_info,
         "metrics": metrics,
         "daily": daily_stats,
         "hours": hours_list,
+        "sun_times": sun_times,
         "active_models": active_keys if active_keys else ["best_match"],
         "model_count": len(active_keys) if active_keys else 1,
         "source_label": raw_data.get("_source", "Ensemble Open-Meteo"),
@@ -716,6 +822,8 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     model_count_str = f"Media {len(data.get('active_models', []))} Modelli" if "best_match" not in data.get("active_models", []) else "Modello Singolo"
     source_label = data.get("source_label", "Ensemble Open-Meteo")
 
+    sun = data.get("sun_times") or calculate_sun_times(loc["lat"], loc["lon"], local_now.date())
+
     out = [
         "🌡️ <b>METEO IN TEMPO REALE</b>",
         f"🏙️ <b>{loc['name'].upper()}</b>",
@@ -728,6 +836,10 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
         f"💦 <b>Umidità Relativa:</b> <code>{cur_rh:.0f}%</code>",
         f"💨 <b>Vento:</b> <code>{cur_ws:.1f} km/h</code> da <code>{cur_wd}</code>",
         f"🌧️ <b>Precipitazione oraria:</b> <code>{cur_rain:.2f} mm</code> (Prob. <code>{cur_prob:.0f}%</code>)\n",
+        "☀️ <b>ORARI SOLE & LUCE (OGGI):</b>",
+        f"🌅 <b>Alba:</b> <code>{sun['sunrise']}</code>  <i>(Crepuscolo: {sun['civil_dawn']})</i>",
+        f"🌇 <b>Tramonto:</b> <code>{sun['sunset']}</code>  <i>(Crepuscolo: {sun['civil_dusk']})</i>",
+        f"⏳ <b>Luce diurna:</b> <code>{sun['daylight']}</code> (Culmine: <code>{sun['solar_noon']}</code>)\n",
         "🔬 <b>CONFRONTO MODELLI ATTIVI:</b>",
         f"{m_temp_str}\n",
         "🕒 <b>TENDENZA PROSSIME 3 ORE:</b>",
@@ -863,6 +975,51 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
     return "\n".join(out)
 
 
+def format_sun_times_message(data: Dict[str, Any]) -> str:
+    """Formatta la scheda specialistica ed esaustiva su Sole, Alba, Tramonto e Crepuscolo Civile."""
+    loc = data["loc"]
+    local_now = data.get("local_now", datetime.now())
+    sun = data.get("sun_times") or calculate_sun_times(loc["lat"], loc["lon"], local_now.date())
+    updated_at = data.get("updated_at", "")
+
+    now_hm = local_now.strftime("%H:%M")
+
+    # Determina la fase solare attiva
+    if now_hm < sun["civil_dawn"]:
+        sun_phase = "🌌 Notte astronomica (Buio completo)"
+    elif now_hm < sun["sunrise"]:
+        sun_phase = "🌅 Crepuscolo civile mattutino (Prime luci all'orizzonte)"
+    elif now_hm < sun["sunset"]:
+        sun_phase = "☀️ Giorno solare (Sole sopra l'orizzonte)"
+    elif now_hm < sun["civil_dusk"]:
+        sun_phase = "🌆 Crepuscolo civile serale (Post-tramonto / Ultime luci)"
+    else:
+        sun_phase = "🌌 Notte astronomica (Buio completo)"
+
+    out = [
+        "☀️ <b>QUADRO SOLARE & ASTRONOMIA DEL GIORNO</b>",
+        f"🏙️ <b>{loc['name'].upper()}</b>",
+        f"📍 <i>{loc.get('desc', loc.get('region', ''))}</i>",
+        f"📅 <i>Oggi: {local_now.strftime('%d/%m/%Y')} (Ore locali: {now_hm})</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🧭 <b>Stato Attuale:</b> {sun_phase}\n",
+        "🌅 <b>FASE MATTUTINA:</b>",
+        f"• <b>Crepuscolo Civile (Prime Luci):</b> <code>{sun['civil_dawn']}</code>",
+        f"• <b>Alba Effettiva (Sole all'orizzonte):</b> <code>{sun['sunrise']}</code>\n",
+        "☀️ <b>CULMINE SOLARE & DURATA LUCE:</b>",
+        f"• <b>Mezzogiorno Astronomico:</b> <code>{sun['solar_noon']}</code>",
+        f"• <b>Durata Luce Solare Diretta:</b> <code>{sun['daylight']}</code>",
+        f"• <b>Luce Utile Totale (con crepuscolo):</b> <code>{sun['twilight_light']}</code>\n",
+        "🌇 <b>FASE SERALE:</b>",
+        f"• <b>Tramonto Effettivo:</b> <code>{sun['sunset']}</code>",
+        f"• <b>Crepuscolo Civile (Inizio buio):</b> <code>{sun['civil_dusk']}</code>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "ℹ️ <i>Il <b>crepuscolo civile</b> è l'intervallo con il sole entro 6° sotto l'orizzonte: vi è luce naturale a sufficienza per vedere e svolgere attività all'aperto senza illuminazione artificiale.</i>\n",
+        f"🕒 <i>Calcolo astronomico NOAA ad alta precisione • {updated_at}</i>"
+    ]
+    return "\n".join(out)
+
+
 def get_inline_keyboard(loc_info: Dict[str, Any], current_tab: str = "forecast", only_rain: bool = False, alert_on: bool = False) -> Dict[str, Any]:
     """Genera la tastiera inline dinamica con selezione città, tab e controlli alert."""
     cur_key = loc_info.get("key", "putignano")
@@ -873,6 +1030,7 @@ def get_inline_keyboard(loc_info: Dict[str, Any], current_tab: str = "forecast",
     now_label = "👉 🌡️ Adesso" if current_tab == "now" else "🌡️ Adesso"
     fore_label = "👉 📅 Previsioni 3gg" if current_tab == "forecast" else "📅 Previsioni 3gg"
     syn_label = "👉 📡 Sinottico" if current_tab == "synoptic" else "📡 Sinottico"
+    sun_label = "👉 ☀️ Sole & Crepuscolo" if current_tab == "sun" else "☀️ Sole & Crepuscolo"
 
     rain_label = "🌧️ Solo Pioggia (ATTIVO)" if only_rain else "🌧️ Solo Pioggia"
     alert_label = "🔔 Alert Pioggia: ON" if alert_on else "🔕 Alert Pioggia: OFF"
@@ -893,8 +1051,11 @@ def get_inline_keyboard(loc_info: Dict[str, Any], current_tab: str = "forecast",
             row1,
             [
                 {"text": now_label, "callback_data": f"tab_{current_tab}_now"},
-                {"text": fore_label, "callback_data": f"tab_{current_tab}_forecast"},
-                {"text": syn_label, "callback_data": f"tab_{current_tab}_synoptic"}
+                {"text": fore_label, "callback_data": f"tab_{current_tab}_forecast"}
+            ],
+            [
+                {"text": syn_label, "callback_data": f"tab_{current_tab}_synoptic"},
+                {"text": sun_label, "callback_data": f"tab_{current_tab}_sun"}
             ],
             [
                 {"text": rain_label, "callback_data": f"toggle_rain_{'off' if only_rain else 'on'}"},
@@ -989,6 +1150,7 @@ class TelegramBotClient:
         commands = [
             {"command": "start", "description": "Apri il menu meteo principale"},
             {"command": "adesso", "description": "Temperatura e meteo in tempo reale"},
+            {"command": "sole", "description": "Alba, tramonto e crepuscolo civile di oggi"},
             {"command": "putignano", "description": "Previsioni 3 giorni per Putignano"},
             {"command": "monza", "description": "Previsioni 3 giorni per Monza"},
             {"command": "citta", "description": "Cerca qualsiasi città (es. /citta Roma)"},
@@ -1205,6 +1367,11 @@ class WeatherBotRunner:
             self.user_current_tab[chat_id] = "synoptic"
             self.send_view(chat_id, cur_loc, "synoptic")
 
+        elif low_text in ("/sole", "sole", "/alba", "alba", "/tramonto", "tramonto", "/crepuscolo", "crepuscolo", "/astronomia", "astronomia", "/luce", "luce"):
+            cur_loc = self.get_user_loc(chat_id)
+            self.user_current_tab[chat_id] = "sun"
+            self.send_view(chat_id, cur_loc, "sun")
+
         elif low_text in ("/pioggia", "pioggia", "/solo-pioggia"):
             current_mode = self.user_rain_mode.get(chat_id, False)
             self.user_rain_mode[chat_id] = not current_mode
@@ -1360,9 +1527,10 @@ class WeatherBotRunner:
             target_tab = data.split("_")[2]
             cur_tab = target_tab
             self.user_current_tab[chat_id] = cur_tab
-            if cur_tab == "now":
+            if cur_tab in ("now", "sun"):
                 force_refresh = True
-            self.client.answer_callback_query(cb_id, text=f"Scheda: {cur_tab.capitalize()}")
+            tab_labels = {"now": "Adesso", "forecast": "Previsioni 3gg", "synoptic": "Sinottico", "sun": "Sole & Crepuscolo"}
+            self.client.answer_callback_query(cb_id, text=f"Scheda: {tab_labels.get(cur_tab, cur_tab.capitalize())}")
 
         elif data.startswith("refresh_"):
             force_refresh = True
@@ -1405,6 +1573,8 @@ class WeatherBotRunner:
             return format_current_weather_message(data)
         elif tab == "synoptic":
             return format_single_city_synoptic_message(data, loc["key"])
+        elif tab == "sun":
+            return format_sun_times_message(data)
         else:
             return format_city_weather_message(data, only_rain=only_rain)
 
