@@ -35,7 +35,7 @@ Guida rapida per configurare e usare il tuo Bot Telegram su **Render.com** (o in
 Sui servizi cloud gratuiti come Render, l'indirizzo IP di uscita è condiviso con migliaia di altri utenti e può capitare che Open-Meteo restituisca temporaneamente l'errore `HTTP 429 Too Many Requests` per colpa di altro traffico nel datacenter.
 
 Il bot risolve questo problema in modo completamente trasparente:
-1. **Sorgente Primaria:** Open-Meteo Multi-Modello (*ECMWF, ICON, M-France, GFS, JMA*).
+1. **Sorgente Primaria:** Open-Meteo Multi-Modello (Ensemble di 10 modelli: *ECMWF, ICON-EU, ICON, M-France, ARPEGE, GFS, JMA, GEM, CMA Grapes, BOM Access*) con architettura di degradazione adattiva a scalini (10 -> 7 -> 5 -> 3 -> 1 -> Best Match).
 2. **Sorgente di Riserva Istantanea (MET Norway Locationforecast 2.0):** Se Open-Meteo è limitato o irraggiungibile, il bot interroga all'istante i supercomputer meteorologici dell'Istituto Meteorologico Norvegese (servizio pubblico europeo, 100% gratuito e senza rate-limit).
 3. **Nessun messaggio di errore o avvisi invasivi:** I messaggi mostrano sempre in modo pulito e immediato l'orario effettivo di rilevamento.
 

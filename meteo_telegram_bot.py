@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Meteo Multi-Modello (Ensemble 5 Modelli) - Standalone Telegram Bot (Zero External Dependencies)
-Bot Telegram completo per previsioni meteo, geocoding globale, coordinate GPS e monitor allerta pioggia multi-punto.
+Meteo Multi-Modello (Ensemble 10 Modelli) - Standalone Telegram Bot (Zero External Dependencies)
+Autonomo, robusto, pronto per Render.com / Railway / VPS / Locale.
+Include Server HTTP integrato con Dashboard Web e Health Check su porta 8080/10000.
+Supporta ricerca per qualsiasi città, geocoding globale, coordinate GPS e alert pioggia periodico.
+Doppia sorgente dati ad alta resilienza (Open-Meteo Ensemble + MET Norway Locationforecast).
 Utilizza esclusivamente la libreria standard Python (urllib, json, threading, http.server)
 ed è ottimizzato per l'esecuzione locale e il deploy gratuito 24/7 su Cloud (Render, Railway, Koyeb).
 """
@@ -57,19 +60,25 @@ DEFAULT_LOCATIONS = {
     }
 }
 
-# Modelli meteorologici inclusi nell'ensemble
+# Modelli meteorologici inclusi nell'ensemble (10 modelli globali e regionali ad alta risoluzione)
 MODELS = {
     "ecmwf_ifs025": "ECMWF (UE)",
-    "dwd_icon_eu": "ICON (DE)",
+    "dwd_icon_eu": "ICON-EU (DE)",
+    "dwd_icon": "ICON (DE)",
     "meteofrance_seamless": "M-France (FR)",
+    "meteofrance_arpege_seamless": "ARPEGE (FR)",
     "gfs_global": "GFS (USA)",
-    "jma_seamless": "JMA (JP)"
+    "jma_seamless": "JMA (JP)",
+    "gem_seamless": "GEM (CA)",
+    "cma_grapes_global": "CMA (CN)",
+    "bom_access_global": "BOM (AU)"
 }
 
 # Livelli di degradazione adattiva per superare i rate-limit 429 di Open-Meteo
 MODEL_TIERS = [
-    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],  # 5 modelli completi
-    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global"],                 # 4 modelli
+    ["ecmwf_ifs025", "dwd_icon_eu", "dwd_icon", "meteofrance_seamless", "meteofrance_arpege_seamless", "gfs_global", "jma_seamless", "gem_seamless", "cma_grapes_global", "bom_access_global"],  # 10 modelli completi
+    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless", "gem_seamless", "bom_access_global"],  # 7 modelli intermedi
+    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],  # 5 modelli consolidati
     ["ecmwf_ifs025", "dwd_icon_eu", "gfs_global"],                                        # 3 modelli
     ["ecmwf_ifs025", "dwd_icon_eu"],                                                       # 2 modelli
     ["ecmwf_ifs025"],                                                                      # 1 modello (ECMWF)
@@ -1668,9 +1677,11 @@ class WeatherBotRunner:
         elif low_text in ("/help", "help", "guida"):
             help_text = (
                 "ℹ️ <b>GUIDA METEO ENSEMBLE BOT</b>\n\n"
-                "Questo bot confronta in tempo reale 5 modelli meteorologici mondiali:\n"
-                "• <b>ECMWF IFS (UE)</b> • <b>DWD ICON-EU (DE)</b> • <b>Météo-France (FR)</b>\n"
-                "• <b>GFS Global (USA)</b> • <b>JMA Seamless (JP)</b>\n\n"
+                "Questo bot confronta in tempo reale 10 modelli meteorologici mondiali e regionali:\n"
+                "• <b>ECMWF IFS (UE)</b> • <b>ICON-EU & ICON (DE)</b>\n"
+                "• <b>M-France & ARPEGE (FR)</b> • <b>GFS Global (USA)</b>\n"
+                "• <b>JMA Seamless (JP)</b> • <b>GEM Seamless (CA)</b>\n"
+                "• <b>CMA Grapes (CN)</b> • <b>BOM Access (AU)</b>\n\n"
                 "🔍 <b>Ricerca Città & Posizione GPS:</b>\n"
                 "• Scrivi il nome di qualsiasi città (es. <code>Roma</code>, <code>Bari</code>, <code>Milano</code>) o usa <code>/citta Firenze</code>.\n"
                 "• Invia la tua posizione GPS toccando la graffetta 📎 -> <b>Posizione</b>.\n"
@@ -1988,7 +1999,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     <div class="card">
         <div class="badge">ONLINE &amp; ACTIVE 24/7</div>
         <h1>🌦️ Meteo <span>Ensemble Bot</span></h1>
-        <p class="subtitle">5 Modelli &bull; Geocoding &bull; GPS &bull; Alert Pioggia</p>
+        <p class="subtitle">10 Modelli &bull; Geocoding &bull; GPS &bull; Alert Pioggia</p>
         
         <div class="stats-grid">
             <div class="stat-box">
