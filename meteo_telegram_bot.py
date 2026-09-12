@@ -538,8 +538,8 @@ def extract_city_metrics(data: dict) -> dict:
     all_wbs = []
     all_pressures = []
     all_wind_spds = []
+    hourly_spreads = []
     days_data = {}
-    model_max_temps = {m: [] for m in active_keys}
 
     for i, t_str in enumerate(times):
         dt = datetime.fromisoformat(t_str)
@@ -561,9 +561,10 @@ def extract_city_metrics(data: dict) -> dict:
             ws_vals = [safe_float(hourly.get(f"wind_speed_10m_{m}", [None])[i]) for m in active_keys if hourly.get(f"wind_speed_10m_{m}") is not None]
             pres_vals = [safe_float(hourly.get(f"pressure_msl_{m}", [None])[i], 1013.25) for m in active_keys if hourly.get(f"pressure_msl_{m}") is not None]
 
-            for m in active_keys:
-                if hourly.get(f"temperature_2m_{m}") is not None:
-                    model_max_temps[m].append(safe_float(hourly.get(f"temperature_2m_{m}")[i]))
+            # Calcola lo spread orario sincronizzato tra i modelli per quest'ora
+            valid_hour_temps = [t for t in t_vals if t is not None]
+            if len(valid_hour_temps) >= 2:
+                hourly_spreads.append(max(valid_hour_temps) - min(valid_hour_temps))
 
             avg_t = sum(t_vals) / len(t_vals) if t_vals else 0.0
             avg_p = sum(p_vals) / len(p_vals) if p_vals else 0.0
@@ -590,11 +591,10 @@ def extract_city_metrics(data: dict) -> dict:
         if avg_p > 0.1:
             days_data[day_str]["rain_hours"] += 1
 
+    # Spread termico multi-modello medio sincronizzato (rappresenta l'incertezza oraria reale dell'ensemble)
     model_spread = 0.0
-    if model_max_temps:
-        valid_model_maxs = [max(vals) for vals in model_max_temps.values() if vals and len(vals) > 0]
-        if len(valid_model_maxs) >= 2:
-            model_spread = round(max(valid_model_maxs) - min(valid_model_maxs), 1)
+    if hourly_spreads:
+        model_spread = round(sum(hourly_spreads) / len(hourly_spreads), 1)
 
     p_delta = round(all_pressures[-1] - all_pressures[0], 1) if len(all_pressures) > 1 else 0.0
 
@@ -1102,43 +1102,47 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
             f"Valori di bulbo umido confortevoli (<code>{max_wb:.1f}°C</code>) con modesta turbolenza e buona qualità dell'aria."
         )
 
-    # 4. Analisi di Stabilità & Finestra Esatta del Cambiamento
-    change_event = None
-    for slot in hours:
-        if slot.get("rain_mm", 0.0) >= 0.4 or slot.get("rain_prob", 0.0) >= 40.0:
-            change_event = {
-                "day": slot["day"],
-                "hour": slot["hour"],
-                "reason": "precipitazioni",
-                "detail": f"attivazione di rovesci con probabilità al <code>{slot['rain_prob']:.0f}%</code> e intensità oraria di <code>{slot['rain_mm']:.1f} mm</code> ({slot['wmo_label']})",
-                "wind": f"venti da {slot['wind_dir']} a {slot['wind_spd']:.1f} km/h"
-            }
-            break
-        elif slot.get("wind_spd", 0.0) >= 35.0:
-            change_event = {
-                "day": slot["day"],
-                "hour": slot["hour"],
-                "reason": "vento",
-                "detail": f"brusco rinforzo anemometrico con raffiche fino a <code>{slot['wind_spd']:.1f} km/h</code> da <code>{slot['wind_dir']}</code>",
-                "wind": f"rotazione su {slot['wind_dir']}"
-            }
-            break
+    # 4. Analisi di Stabilità & Quadro Piogge su 72 Ore (Giorno per Giorno)
+    daily_stats = data.get("daily", {})
+    rain_days_info = []
 
-    if change_event:
-        stability_status = "Instabilità in Ingresso / Transizione Frontale"
+    for d_label, d_info in daily_stats.items():
+        tot_mm = d_info.get("total_mm_avg", 0.0)
+        max_prob = d_info.get("max_prob", 0.0)
+        r_slots = d_info.get("rain_slots", [])
+        
+        # Filtra slot con pioggia effettiva (>= 0.1mm o probabilità significativa >= 30%)
+        sig_slots = [s for s in r_slots if s.get("mm", 0.0) >= 0.1 or s.get("prob", 0.0) >= 30.0]
+        
+        if sig_slots and (tot_mm >= 0.2 or max_prob >= 35.0):
+            first_h = sig_slots[0]["hour"]
+            last_h = sig_slots[-1]["hour"]
+            time_window = f"dalle ore {first_h} alle {last_h}" if first_h != last_h else f"attorno alle ore {first_h}"
+            rain_days_info.append(
+                f"• 🌧️ <b>{d_label}:</b> <b>Pioggia attesa {time_window}</b> "
+                f"(accumulo stimato: <code>{tot_mm:.1f} mm</code>, picco probabilità: <code>{max_prob:.0f}%</code>)"
+            )
+        else:
+            rain_days_info.append(
+                f"• ☀️ <b>{d_label}:</b> <i>Asciutto / Nessuna pioggia prevista</i> (picco prob: <code>{max_prob:.0f}%</code>)"
+            )
+
+    has_rain_any_day = any("🌧️" in line for line in rain_days_info)
+    if has_rain_any_day:
+        stability_status = "Instabilità con Precipitazioni Previste"
         timing_desc = (
-            f"⚠️ <b>Finestra Temporale del Cambiamento:</b> La fase di stabilità iniziale subirà un cedimento da "
-            f"<b>{change_event['day']} attorno alle ore {change_event['hour']}</b>.\n"
-            f"• <i>Fenomeno atteso:</i> {change_event['detail']}.\n"
-            f"• <i>Dinamica al suolo:</i> {change_event['wind']} con progressiva rottura della stazionarietà barica."
+            f"🌧️ <b>PROIEZIONE PIOGGE NELLE 72 ORE:</b>\n" +
+            "\n".join(rain_days_info) + "\n"
+            f"• <i>Dinamica generale:</i> Passaggi nuvolosi forieri di rovesci intermittenti. "
+            f"Consultare il dettaglio orario nella scheda [📅 Previsioni 3gg] per la sequenza dei fenomeni."
         )
     else:
-        stability_status = "Stabilità Continua su 72 Ore (Fase Schermata)"
+        stability_status = "Stabilità Continua (Nessun Peggioramento)"
         timing_desc = (
-            f"🛡️ <b>Stabilità Continua:</b> <b>Nessun peggioramento o rottura della circolazione atteso nelle 72 ore.</b>\n"
-            f"• La colonna troposferica risulterà costantemente inibita dalla compressione dell'aria al suolo, "
-            f"mantenendo assenza totale di precipitazioni organizzate, cielo prevalentemente sgombro o poco nuvoloso "
-            f"e condizioni ideali per tutte le attività all'aperto e la navigazione."
+            f"☀️ <b>NESSUNA PIOGGIA PREVISTA NELLE PROSSIME 72 ORE:</b>\n" +
+            "\n".join(rain_days_info) + "\n"
+            f"• <i>Dinamica generale:</i> La colonna troposferica resta protetta dal campo di alta pressione, "
+            f"con assenza totale di piogge organizzate e condizioni favorevoli per tutte le attività all'aperto."
         )
 
     # 5. Ventilazione & Circolazione Anemometrica
