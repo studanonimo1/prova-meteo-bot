@@ -525,7 +525,11 @@ def extract_city_metrics(data: dict) -> dict:
     if not times:
         return {}
 
-    active_keys = [m for m in MODELS.keys() if f"temperature_2m_{m}" in hourly]
+    # Rileva quali modelli sono effettivamente presenti con valori validi nei dati
+    active_keys = [
+        m for m in MODELS.keys()
+        if f"temperature_2m_{m}" in hourly and any(x is not None for x in hourly[f"temperature_2m_{m}"])
+    ]
     is_single_best_match = len(active_keys) == 0 and "temperature_2m" in hourly
 
     all_temps = []
@@ -588,9 +592,9 @@ def extract_city_metrics(data: dict) -> dict:
 
     model_spread = 0.0
     if model_max_temps:
-        m_maxs = [max(vals) for vals in model_max_temps.values() if vals]
-        if m_maxs:
-            model_spread = round(max(m_maxs) - min(m_maxs), 1)
+        valid_model_maxs = [max(vals) for vals in model_max_temps.values() if vals and len(vals) > 0]
+        if len(valid_model_maxs) >= 2:
+            model_spread = round(max(valid_model_maxs) - min(valid_model_maxs), 1)
 
     p_delta = round(all_pressures[-1] - all_pressures[0], 1) if len(all_pressures) > 1 else 0.0
 
@@ -663,8 +667,11 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
     hourly = raw_data.get("hourly", {})
     times = hourly.get("time", [])
 
-    # Rileva quali modelli sono presenti nei dati
-    active_keys = [m for m in MODELS.keys() if f"temperature_2m_{m}" in hourly]
+    # Rileva quali modelli sono presenti nei dati con valori validi
+    active_keys = [
+        m for m in MODELS.keys()
+        if f"temperature_2m_{m}" in hourly and any(x is not None for x in hourly[f"temperature_2m_{m}"])
+    ]
     is_single_best_match = len(active_keys) == 0 and "temperature_2m" in hourly
 
     daily_stats: Dict[str, Any] = {}
@@ -1144,10 +1151,13 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
 
     # 6. Affidabilità Predittiva Multi-Modello
     model_count = len(active_m) if active_m and "best_match" not in active_m else 1
+    active_model_names = [MODELS.get(k, k) for k in active_m if k in MODELS]
+    models_summary_label = ", ".join(active_model_names[:5]) + (f" e altri {len(active_model_names)-5}" if len(active_model_names) > 5 else "")
+
     if model_spread < 1.8 and model_count > 1:
         confidence_badge = "🟢 ELEVATA (Consenso ≥ 90%)"
         confidence_desc = (
-            f"I {model_count} modelli meteorologici globali (ECMWF, ICON, GFS, M-France, JMA) convergono con precisione "
+            f"I {model_count} modelli meteorologici dell'ensemble ({models_summary_label}) convergono con precisione "
             f"elevata sulla traiettoria barica e sull'evoluzione termica (spread massimo limitato a <code>{model_spread:.1f}°C</code>). "
             f"Previsione ad alta affidabilità."
         )
@@ -1155,7 +1165,7 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
         confidence_badge = "🟡 BUONA / MEDIA (Consenso ≈ 75%)"
         confidence_desc = (
             f"Accordo generale tra i modelli sui tratti barici salienti; permangono modeste divergenze orarie "
-            f"sull'esatta entità dei picchi termici massimi (spread di <code>{model_spread:.1f}°C</code> tra modelli europei ed americani)."
+            f"sull'esatta entità dei picchi termici massimi (spread di <code>{model_spread:.1f}°C</code> tra i modelli dell'ensemble)."
         )
     else:
         confidence_badge = "🟠 MEDIO-BASSA (Dispersione Modellistica)"
@@ -1193,7 +1203,7 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
         f"• <b>Indice di Accordo:</b> {confidence_badge}\n{confidence_desc}\n",
         "━━━━━━━━━━━━━━━━━━━━",
         f"📋 <b>GIUDIZIO DI SINTESI OPERATIVA:</b>\n<i>{op_summary}</i>\n",
-        f"🕒 <i>Bollettino elaborato con integrazione Ensemble ECMWF • ICON • GFS • M-France • JMA</i>"
+        f"🕒 <i>Bollettino elaborato con integrazione Ensemble Multi-Modello (10 centri meteo internazionali)</i>"
     ]
     return "\n".join(out)
 
