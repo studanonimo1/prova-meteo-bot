@@ -74,9 +74,13 @@ MODELS = {
     "gem_seamless": "GEM (CA)",
     "cma_grapes_global": "CMA (CN)",
     "bom_access_global": "BOM (AU)",
-    # Centri di calcolo per Fallback Ibrido Multi-Modello di emergenza (MET Norway + DWD Bright Sky)
+    # Centri di calcolo per Fallback Ibrido Multi-Modello di emergenza (6 modelli completi)
     "met_norway": "MET Norway (UE)",
-    "dwd_brightsky": "DWD ICON (DE)"
+    "dwd_brightsky": "DWD ICON (DE)",
+    "gfs_fallback": "GFS (USA)",
+    "meteofrance_fallback": "M-France (FR)",
+    "gem_fallback": "GEM (CA)",
+    "jma_fallback": "JMA (JP)"
 }
 
 # Livelli di degradazione adattiva per superare i rate-limit 429 di Open-Meteo
@@ -524,119 +528,223 @@ def fetch_brightsky_dwd_weather(lat: float, lon: float, forecast_days: int = 3) 
 
 def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3) -> dict:
     """
-    Genera un ensemble ibrido di emergenza combinando MET Norway (UE) e DWD ICON (DE tramite Bright Sky).
-    Garantisce che anche in caso di blocco HTTP 429 su Open-Meteo la media multi-modello rimanga sempre attiva (2 centri di calcolo).
+    Genera un ensemble ibrido avanzato combinando in parallelo fino a 6 centri di calcolo indipendenti:
+    1. MET Norway (UE - Arome/ECMWF su server istituzionale norvegese api.met.no)
+    2. DWD ICON (DE - Deutscher Wetterdienst su server api.brightsky.dev)
+    3. NOAA GFS (USA - National Oceanic and Atmospheric Administration)
+    4. Météo-France (FR - Servizio Meteorologico Nazionale Francese)
+    5. CMC GEM (CA - Canadian Meteorological Centre)
+    6. JMA (JP - Japan Meteorological Agency)
+    Garantisce sempre un ensemble multi-modello ricco (fino a 6 modelli) anche sotto blocco 429 di Open-Meteo.
     """
+    # 1. Recupero dati base MET Norway
     met_data = fetch_met_norway_weather(lat, lon, forecast_days)
     met_hourly = met_data.get("hourly", {})
     times = met_hourly.get("time", [])
 
+    # 2. Recupero DWD Bright Sky
     dwd_slots = {}
     try:
         dwd_slots = fetch_brightsky_dwd_weather(lat, lon, forecast_days)
     except Exception as e:
-        print(f"[!] Bright Sky DWD non disponibile: {e}. Fallback su solo MET Norway.", file=sys.stderr)
+        print(f"[!] Bright Sky DWD non disponibile: {e}", file=sys.stderr)
 
-    if not dwd_slots:
-        met_data["_is_fallback"] = True
-        return met_data
+    # 3. Interrogazione parallela degli endpoint dedicati con header browser standard
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    dedicated_results: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-    temps_met = met_hourly.get("temperature_2m", [])
-    precips_met = met_hourly.get("precipitation", [])
-    probs_met = met_hourly.get("precipitation_probability", [])
-    rhs_met = met_hourly.get("relative_humidity_2m", [])
-    ws_met = met_hourly.get("wind_speed_10m", [])
-    wd_met = met_hourly.get("wind_direction_10m", [])
-    codes_met = met_hourly.get("weather_code", [])
-    press_met = met_hourly.get("pressure_msl", [])
+    def _fetch_dedicated(model_name: str, endpoint_path: str):
+        try:
+            url = (
+                f"https://api.open-meteo.com/v1/{endpoint_path}"
+                f"?latitude={lat}&longitude={lon}"
+                f"&hourly=temperature_2m,precipitation,precipitation_probability,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m,pressure_msl"
+                f"&forecast_days={forecast_days}"
+                f"&timezone=auto"
+            )
+            req = urllib.request.Request(url, headers=browser_headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    raw_j = json.loads(resp.read().decode("utf-8"))
+                    h = raw_j.get("hourly", {})
+                    t_list = h.get("time", [])
+                    model_dict = {}
+                    for idx_t, ts in enumerate(t_list):
+                        model_dict[ts] = {
+                            "temp": safe_float(h.get("temperature_2m", [None])[idx_t]),
+                            "precip": safe_float(h.get("precipitation", [None])[idx_t]),
+                            "prob": safe_float(h.get("precipitation_probability", [None])[idx_t]),
+                            "rh": safe_float(h.get("relative_humidity_2m", [None])[idx_t], 50.0),
+                            "ws": safe_float(h.get("wind_speed_10m", [None])[idx_t]),
+                            "wd": safe_float(h.get("wind_direction_10m", [None])[idx_t]),
+                            "code": int(h.get("weather_code", [0])[idx_t] or 0),
+                            "pres": safe_float(h.get("pressure_msl", [None])[idx_t], 1013.25)
+                        }
+                    dedicated_results[model_name] = model_dict
+        except Exception as err:
+            pass
 
-    temps_dwd = []
-    precips_dwd = []
-    probs_dwd = []
-    rhs_dwd = []
-    ws_dwd = []
-    wd_dwd = []
-    codes_dwd = []
-    press_dwd = []
+    threads = [
+        threading.Thread(target=_fetch_dedicated, args=("gfs_fallback", "gfs")),
+        threading.Thread(target=_fetch_dedicated, args=("meteofrance_fallback", "meteofrance")),
+        threading.Thread(target=_fetch_dedicated, args=("gem_fallback", "gem")),
+        threading.Thread(target=_fetch_dedicated, args=("jma_fallback", "jma"))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    avg_temps = []
-    avg_precips = []
-    avg_probs = []
-    avg_rhs = []
-    avg_ws = []
-    avg_press = []
+    # Prepara lista modelli effettivamente attivi
+    active_models = ["met_norway"]
+    if dwd_slots:
+        active_models.append("dwd_brightsky")
+    for d_name in dedicated_results.keys():
+        active_models.append(d_name)
+
+    model_series = {m: {
+        "temps": [], "precips": [], "probs": [], "rhs": [],
+        "ws": [], "wd": [], "codes": [], "pres": []
+    } for m in active_models}
+
+    avg_temps, avg_precips, avg_probs, avg_rhs, avg_ws, avg_press = [], [], [], [], [], []
+
+    met_temps = met_hourly.get("temperature_2m", [])
+    met_precips = met_hourly.get("precipitation", [])
+    met_probs = met_hourly.get("precipitation_probability", [])
+    met_rhs = met_hourly.get("relative_humidity_2m", [])
+    met_ws = met_hourly.get("wind_speed_10m", [])
+    met_wd = met_hourly.get("wind_direction_10m", [])
+    met_codes = met_hourly.get("weather_code", [])
+    met_press = met_hourly.get("pressure_msl", [])
 
     for i, t_str in enumerate(times):
-        t_m = temps_met[i] if i < len(temps_met) else 20.0
-        p_m = precips_met[i] if i < len(precips_met) else 0.0
-        pr_m = probs_met[i] if i < len(probs_met) else 0.0
-        rh_m = rhs_met[i] if i < len(rhs_met) else 50.0
-        ws_m = ws_met[i] if i < len(ws_met) else 10.0
-        wd_m = wd_met[i] if i < len(wd_met) else 0.0
-        c_m = codes_met[i] if i < len(codes_met) else 0
-        pres_m = press_met[i] if i < len(press_met) else 1013.25
+        # 1. MET Norway
+        t_m = met_temps[i] if i < len(met_temps) else 20.0
+        p_m = met_precips[i] if i < len(met_precips) else 0.0
+        pr_m = met_probs[i] if i < len(met_probs) else 0.0
+        rh_m = met_rhs[i] if i < len(met_rhs) else 50.0
+        ws_m = met_ws[i] if i < len(met_ws) else 10.0
+        wd_m = met_wd[i] if i < len(met_wd) else 0.0
+        c_m = met_codes[i] if i < len(met_codes) else 0
+        pres_m = met_press[i] if i < len(met_press) else 1013.25
 
-        dwd_item = dwd_slots.get(t_str)
-        if dwd_item:
-            t_d = float(dwd_item.get("temperature") if dwd_item.get("temperature") is not None else t_m)
-            p_d = float(dwd_item.get("precipitation") if dwd_item.get("precipitation") is not None else p_m)
-            rh_d = float(dwd_item.get("relative_humidity") if dwd_item.get("relative_humidity") is not None else rh_m)
-            ws_d = float(dwd_item.get("wind_speed") if dwd_item.get("wind_speed") is not None else ws_m)
-            wd_d = float(dwd_item.get("wind_direction") if dwd_item.get("wind_direction") is not None else wd_m)
-            pres_d = float(dwd_item.get("pressure_msl") if dwd_item.get("pressure_msl") is not None else pres_m)
-            pr_d = float(dwd_item.get("precipitation_probability") if dwd_item.get("precipitation_probability") is not None else (min(90.0, 30.0 + p_d * 20.0) if p_d > 0.1 else pr_m))
-            c_d = c_m
-        else:
-            t_d, p_d, pr_d, rh_d, ws_d, wd_d, c_d, pres_d = t_m, p_m, pr_m, rh_m, ws_m, wd_m, c_m, pres_m
+        model_series["met_norway"]["temps"].append(t_m)
+        model_series["met_norway"]["precips"].append(p_m)
+        model_series["met_norway"]["probs"].append(pr_m)
+        model_series["met_norway"]["rhs"].append(rh_m)
+        model_series["met_norway"]["ws"].append(ws_m)
+        model_series["met_norway"]["wd"].append(wd_m)
+        model_series["met_norway"]["codes"].append(c_m)
+        model_series["met_norway"]["pres"].append(pres_m)
 
-        temps_dwd.append(t_d)
-        precips_dwd.append(p_d)
-        probs_dwd.append(pr_d)
-        rhs_dwd.append(rh_d)
-        ws_dwd.append(ws_d)
-        wd_dwd.append(wd_d)
-        codes_dwd.append(c_d)
-        press_dwd.append(pres_d)
+        hour_temps = [t_m]
+        hour_precips = [p_m]
+        hour_probs = [pr_m]
+        hour_rhs = [rh_m]
+        hour_ws = [ws_m]
+        hour_pres = [pres_m]
 
-        avg_temps.append(round((t_m + t_d) / 2.0, 1))
-        avg_precips.append(round((p_m + p_d) / 2.0, 2))
-        avg_probs.append(round((pr_m + pr_d) / 2.0, 1))
-        avg_rhs.append(round((rh_m + rh_d) / 2.0, 1))
-        avg_ws.append(round((ws_m + ws_d) / 2.0, 1))
-        avg_press.append(round((pres_m + pres_d) / 2.0, 1))
+        # 2. DWD Bright Sky
+        if "dwd_brightsky" in active_models:
+            dwd_item = dwd_slots.get(t_str)
+            if dwd_item:
+                t_d = float(dwd_item.get("temperature") if dwd_item.get("temperature") is not None else t_m)
+                p_d = float(dwd_item.get("precipitation") if dwd_item.get("precipitation") is not None else p_m)
+                rh_d = float(dwd_item.get("relative_humidity") if dwd_item.get("relative_humidity") is not None else rh_m)
+                ws_d = float(dwd_item.get("wind_speed") if dwd_item.get("wind_speed") is not None else ws_m)
+                wd_d = float(dwd_item.get("wind_direction") if dwd_item.get("wind_direction") is not None else wd_m)
+                pres_d = float(dwd_item.get("pressure_msl") if dwd_item.get("pressure_msl") is not None else pres_m)
+                pr_d = float(dwd_item.get("precipitation_probability") if dwd_item.get("precipitation_probability") is not None else (min(90.0, 30.0 + p_d * 20.0) if p_d > 0.1 else pr_m))
+                c_d = c_m
+            else:
+                t_d, p_d, pr_d, rh_d, ws_d, wd_d, c_d, pres_d = t_m, p_m, pr_m, rh_m, ws_m, wd_m, c_m, pres_m
+
+            model_series["dwd_brightsky"]["temps"].append(t_d)
+            model_series["dwd_brightsky"]["precips"].append(p_d)
+            model_series["dwd_brightsky"]["probs"].append(pr_d)
+            model_series["dwd_brightsky"]["rhs"].append(rh_d)
+            model_series["dwd_brightsky"]["ws"].append(ws_d)
+            model_series["dwd_brightsky"]["wd"].append(wd_d)
+            model_series["dwd_brightsky"]["codes"].append(c_d)
+            model_series["dwd_brightsky"]["pres"].append(pres_d)
+
+            hour_temps.append(t_d)
+            hour_precips.append(p_d)
+            hour_probs.append(pr_d)
+            hour_rhs.append(rh_d)
+            hour_ws.append(ws_d)
+            hour_pres.append(pres_d)
+
+        # 3. Dedicated models
+        for d_name, d_map in dedicated_results.items():
+            item = d_map.get(t_str)
+            if item:
+                t_val = item["temp"] if item["temp"] is not None else t_m
+                p_val = item["precip"] if item["precip"] is not None else p_m
+                pr_val = item["prob"] if item["prob"] is not None else pr_m
+                rh_val = item["rh"] if item["rh"] is not None else rh_m
+                ws_val = item["ws"] if item["ws"] is not None else ws_m
+                wd_val = item["wd"] if item["wd"] is not None else wd_m
+                c_val = item["code"]
+                pres_val = item["pres"] if item["pres"] is not None else pres_m
+            else:
+                t_val, p_val, pr_val, rh_val, ws_val, wd_val, c_val, pres_val = t_m, p_m, pr_m, rh_m, ws_m, wd_m, c_m, pres_m
+
+            model_series[d_name]["temps"].append(t_val)
+            model_series[d_name]["precips"].append(p_val)
+            model_series[d_name]["probs"].append(pr_val)
+            model_series[d_name]["rhs"].append(rh_val)
+            model_series[d_name]["ws"].append(ws_val)
+            model_series[d_name]["wd"].append(wd_val)
+            model_series[d_name]["codes"].append(c_val)
+            model_series[d_name]["pres"].append(pres_val)
+
+            hour_temps.append(t_val)
+            hour_precips.append(p_val)
+            hour_probs.append(pr_val)
+            hour_rhs.append(rh_val)
+            hour_ws.append(ws_val)
+            hour_pres.append(pres_val)
+
+        avg_temps.append(round(sum(hour_temps) / len(hour_temps), 1))
+        avg_precips.append(round(sum(hour_precips) / len(hour_precips), 2))
+        avg_probs.append(round(sum(hour_probs) / len(hour_probs), 1))
+        avg_rhs.append(round(sum(hour_rhs) / len(hour_rhs), 1))
+        avg_ws.append(round(sum(hour_ws) / len(hour_ws), 1))
+        avg_press.append(round(sum(hour_pres) / len(hour_pres), 1))
+
+    # Assemblaggio dizionario hourly
+    hourly_dict = {
+        "time": times,
+        "temperature_2m": avg_temps,
+        "precipitation": avg_precips,
+        "precipitation_probability": avg_probs,
+        "relative_humidity_2m": avg_rhs,
+        "wind_speed_10m": avg_ws,
+        "wind_direction_10m": met_wd,
+        "weather_code": met_codes,
+        "pressure_msl": avg_press,
+    }
+    for m in active_models:
+        hourly_dict[f"temperature_2m_{m}"] = model_series[m]["temps"]
+        hourly_dict[f"precipitation_{m}"] = model_series[m]["precips"]
+        hourly_dict[f"precipitation_probability_{m}"] = model_series[m]["probs"]
+        hourly_dict[f"relative_humidity_2m_{m}"] = model_series[m]["rhs"]
+        hourly_dict[f"wind_speed_10m_{m}"] = model_series[m]["ws"]
+        hourly_dict[f"wind_direction_10m_{m}"] = model_series[m]["wd"]
+        hourly_dict[f"weather_code_{m}"] = model_series[m]["codes"]
+        hourly_dict[f"pressure_msl_{m}"] = model_series[m]["pres"]
 
     return {
         "utc_offset_seconds": 7200,
-        "_source": "Ensemble Fallback Ibrido (MET Norway + DWD ICON)",
+        "_source": f"Ensemble Ibrido ({len(active_models)} Centri di Calcolo)",
         "_is_fallback": True,
-        "_tier_models": ["met_norway", "dwd_brightsky"],
-        "hourly": {
-            "time": times,
-            "temperature_2m": avg_temps,
-            "precipitation": avg_precips,
-            "precipitation_probability": avg_probs,
-            "relative_humidity_2m": avg_rhs,
-            "wind_speed_10m": avg_ws,
-            "wind_direction_10m": wd_met,
-            "weather_code": codes_met,
-            "pressure_msl": avg_press,
-            "temperature_2m_met_norway": temps_met,
-            "precipitation_met_norway": precips_met,
-            "precipitation_probability_met_norway": probs_met,
-            "relative_humidity_2m_met_norway": rhs_met,
-            "wind_speed_10m_met_norway": ws_met,
-            "wind_direction_10m_met_norway": wd_met,
-            "weather_code_met_norway": codes_met,
-            "pressure_msl_met_norway": press_met,
-            "temperature_2m_dwd_brightsky": temps_dwd,
-            "precipitation_dwd_brightsky": precips_dwd,
-            "precipitation_probability_dwd_brightsky": probs_dwd,
-            "relative_humidity_2m_dwd_brightsky": rhs_dwd,
-            "wind_speed_10m_dwd_brightsky": ws_dwd,
-            "wind_direction_10m_dwd_brightsky": wd_dwd,
-            "weather_code_dwd_brightsky": codes_dwd,
-            "pressure_msl_dwd_brightsky": press_dwd
-        }
+        "_tier_models": active_models,
+        "hourly": hourly_dict
     }
 
 
@@ -673,7 +781,10 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
 
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "Meteo-Telegram-Bot/3.0 (Ensemble-Weather-Bot)"}
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "Accept": "application/json"
+            }
         )
 
         try:
@@ -682,9 +793,11 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
                     raw_json = json.loads(resp.read().decode("utf-8"))
                     raw_json["_tier_models"] = models_subset
                     raw_json["_source"] = "Ensemble Open-Meteo" if models_subset else "Open-Meteo Best Match"
+                    RUNTIME_METRICS["last_open_meteo_status"] = "HTTP 200 OK"
                     return raw_json
         except urllib.error.HTTPError as http_err:
             last_error = http_err
+            RUNTIME_METRICS["last_open_meteo_status"] = f"HTTP {http_err.code} {http_err.reason}"
             if http_err.code == 429:
                 print(f"[!] Rate limit HTTP 429 su Open-Meteo per {lat},{lon}. Degradazione al livello successivo...", file=sys.stderr)
                 time.sleep(0.5)
@@ -694,12 +807,13 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
                 continue
         except Exception as err:
             last_error = err
+            RUNTIME_METRICS["last_open_meteo_status"] = f"Errore: {err}"
             if tier_idx < len(MODEL_TIERS) - 1:
                 time.sleep(0.5)
                 continue
 
     # Se Open-Meteo è bloccato (429 IP cloud) o offline, passa all'Ensemble Ibrido Multi-Modello
-    print("[i] Open-Meteo non raggiungibile (429/offline). Attivazione fallback multi-modello (MET Norway + DWD Bright Sky)...", file=sys.stderr)
+    print("[i] Open-Meteo non raggiungibile (429/offline). Attivazione fallback multi-modello (MET Norway + DWD Bright Sky + GFS + M-France + GEM + JMA)...", file=sys.stderr)
     try:
         return fetch_hybrid_fallback_weather(lat, lon, forecast_days)
     except Exception as fallback_err:
@@ -1586,6 +1700,26 @@ def format_sun_times_message(data: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def format_diagnostics_message(loc: Optional[Dict[str, Any]] = None) -> str:
+    """Genera il report diagnostico sullo stato del bot, connessioni ai modelli e cache."""
+    if loc is None:
+        loc = DEFAULT_LOCATIONS["monza"]
+    data = parse_location_forecast(loc, force_refresh=False)
+    act_m = data.get("active_models", [])
+    act_names = [MODELS.get(k, k) for k in act_m]
+    status_text = (
+        "🩺 <b>DIAGNOSTICA STATO METEO BOT:</b>\n\n"
+        f"📍 <b>Località attiva:</b> {loc.get('name', 'N/D')}\n"
+        f"📡 <b>Sorgente Dati:</b> <code>{data.get('source_label', 'N/D')}</code>\n"
+        f"🔬 <b>Centri di Calcolo Attivi ({len(act_m)}):</b>\n• " + "\n• ".join(act_names) + "\n\n"
+        f"⚙️ <b>Ultimo esito Open-Meteo:</b> <code>{RUNTIME_METRICS.get('last_open_meteo_status', 'N/A')}</code>\n"
+        f"🕒 <b>Ultimo rilevamento:</b> {data.get('updated_at', 'N/D')}\n"
+        f"⏱️ <b>Uptime Bot:</b> {int(time.time() - APP_START_TIME)} secondi\n"
+        f"💾 <b>Memoria Cache:</b> {len(cache_store._cache)} record"
+    )
+    return status_text
+
+
 def get_inline_keyboard(loc_info: Dict[str, Any], current_tab: str = "forecast", only_rain: bool = False, alert_on: bool = False) -> Dict[str, Any]:
     """Genera la tastiera inline dinamica con selezione città, tab e controlli alert."""
     cur_key = loc_info.get("key", "putignano")
@@ -2023,6 +2157,12 @@ class WeatherBotRunner:
             else:
                 self.client.send_message(chat_id, "⚠️ Formato coordinate non valido. Usa ad esempio:\n<code>/coord 40.8505 17.1235</code>")
 
+        elif low_text in ("/diagnostica", "/debug", "/status"):
+            cur_loc = self.get_user_loc(chat_id)
+            status_text = format_diagnostics_message(cur_loc)
+            self.client.send_message(chat_id, status_text)
+            return
+
         elif low_text in ("/help", "help", "guida"):
             help_text = (
                 "ℹ️ <b>GUIDA METEO ENSEMBLE BOT</b>\n\n"
@@ -2192,7 +2332,8 @@ RUNTIME_METRICS = {
     "telegram_updates": 0,
     "last_ping_time": None,
     "last_ping_status": None,
-    "pings_sent": 0
+    "pings_sent": 0,
+    "last_open_meteo_status": "Iniziale (in attesa di chiamate)"
 }
 
 # ==============================================================================

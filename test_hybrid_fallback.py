@@ -1,72 +1,100 @@
 #!/usr/bin/env python3
 """
-Test di verifica del Fallback Ibrido Multi-Modello (MET Norway + DWD Bright Sky).
+Test di verifica del Fallback Ibrido Multi-Modello (fino a 6 centri di calcolo).
 Simula il rate limit HTTP 429 su Open-Meteo e certifica che il bot:
-1. Attiva l'ensemble ibrido di emergenza combinando MET Norway e DWD Bright Sky.
-2. Conserva la media multi-modello (2 centri di calcolo europei).
-3. Genera correttamente schede live, bollettini CML ed editoriali sinottici senza degradare a modello singolo.
+1. Attiva l'ensemble ibrido di emergenza combinando MET Norway, DWD Bright Sky, GFS, Météo-France, GEM e JMA (6 modelli).
+2. Resiste a un'interruzione totale di Open-Meteo degradando con grazia a MET Norway + DWD Bright Sky (2 modelli).
+3. Genera correttamente schede live, bollettini CML ed editoriali sinottici con la corretta indicazione del numero di centri.
+4. Fornisce diagnostica di runtime tramite /diagnostica.
 """
 
 import sys
 import os
 from unittest.mock import patch
 import urllib.error
+import urllib.request
 
 # Aggiunge la directory corrente al path di Python
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import meteo_telegram_bot
 
-def test_hybrid_fallback_on_429():
-    print("=== TEST RESILIENZA FALLBACK IBRIDO (SIMULAZIONE HTTP 429 OPEN-METEO) ===")
+def test_hybrid_fallback_6_models():
+    print("=== TEST 1: FALLBACK IBRIDO 6 MODELLI (HTTP 429 SU V1/FORECAST) ===")
     monza_loc = meteo_telegram_bot.DEFAULT_LOCATIONS["monza"]
+    orig_urlopen = urllib.request.urlopen
 
-    # Simula blocco HTTP 429 costante da Open-Meteo
-    def mock_urlopen_429(req, *args, **kwargs):
+    def mock_urlopen_forecast_429(req, *args, **kwargs):
         url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "open-meteo.com" in url:
+        if "v1/forecast" in url:
             raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
-        # Permetti chiamate reali a api.met.no e api.brightsky.dev
-        return _orig_urlopen(req, *args, **kwargs)
+        return orig_urlopen(req, *args, **kwargs)
 
-    _orig_urlopen = urllib.request.urlopen
-
-    with patch("urllib.request.urlopen", side_effect=mock_urlopen_429):
-        print("\n[1] Esecuzione fetch con Open-Meteo simulato in HTTP 429...")
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen_forecast_429):
         data = meteo_telegram_bot.parse_location_forecast(monza_loc, force_refresh=True)
 
-        # 1. Verifica sorgente e modelli
         print(f" -> Sorgente rilevata: {data.get('source_label')}")
         print(f" -> Modelli attivi: {data.get('active_models')}")
         print(f" -> Numero modelli: {data.get('model_count')}")
 
-        assert data.get("model_count", 0) >= 2, f"Attesi almeno 2 modelli nel fallback, trovati: {data.get('model_count')}"
-        assert "met_norway" in data.get("active_models", []), "Manca met_norway nei modelli attivi"
-        assert "dwd_brightsky" in data.get("active_models", []), "Manca dwd_brightsky nei modelli attivi"
+        assert data.get("model_count", 0) >= 5, f"Attesi almeno 5/6 modelli nel fallback avanzato, trovati: {data.get('model_count')}"
+        assert "met_norway" in data.get("active_models", [])
+        assert "dwd_brightsky" in data.get("active_models", [])
 
-        # 2. Verifica scheda meteo in tempo reale (Adesso)
+        # Scheda live
         current_msg = meteo_telegram_bot.format_current_weather_message(data)
-        print("\n[2] Output Scheda 'Attuale' in Fallback Ibrido:")
-        print(current_msg)
-        assert "Media 2 Modelli" in current_msg, "Manca 'Media 2 Modelli' nella scheda attuale"
-        assert "MET Norway (UE)" in current_msg, "Manca 'MET Norway (UE)' nei modelli della scheda attuale"
-        assert "DWD ICON (DE)" in current_msg, "Manca 'DWD ICON (DE)' nei modelli della scheda attuale"
+        assert f"Media {data.get('model_count')} Modelli" in current_msg
 
-        # 3. Verifica bollettino CML 3gg
+        # Bollettino 3gg
         bulletin_msg = meteo_telegram_bot.format_city_weather_message(data)
-        print("\n[3] Output 'Previsioni 3gg' in Fallback Ibrido:")
-        print(bulletin_msg)
-        assert "media 2 modelli" in bulletin_msg, "Manca 'media 2 modelli' nel bollettino 3gg"
-        assert "modello singolo" not in bulletin_msg, "Trovata dicitura indesiderata 'modello singolo'"
+        assert f"media {data.get('model_count')} modelli" in bulletin_msg
 
-        # 4. Verifica editoriale sinottico
+        # Sinottico
         synoptic_msg = meteo_telegram_bot.format_single_city_synoptic_message(data, monza_loc["key"])
-        print("\n[4] Output 'Sinottico' in Fallback Ibrido:")
-        print(synoptic_msg)
-        assert "media multi-modello (2 centri di calcolo)" in synoptic_msg, "Manca 'media multi-modello (2 centri di calcolo)' nel sinottico"
-        assert "(1 centri di calcolo)" not in synoptic_msg, "Rilevato bug grammaticale (1 centri di calcolo)"
+        assert f"({data.get('model_count')} centri di calcolo)" in synoptic_msg
 
-    print("\n✅ TEST FALLBACK IBRIDO COMPLETATO CON SUCCESSO! La media multi-modello è garantita anche con Open-Meteo in 429.")
+    print(" -> PASS: Fallback 6 modelli validato con successo.")
+
+
+def test_hybrid_fallback_total_outage():
+    print("\n=== TEST 2: RESILIENZA OUTAGE TOTALE OPEN-METEO (DEGRADAZIONE A 2 MODELLI) ===")
+    monza_loc = meteo_telegram_bot.DEFAULT_LOCATIONS["monza"]
+    orig_urlopen = urllib.request.urlopen
+
+    def mock_urlopen_all_openmeteo_down(req, *args, **kwargs):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "open-meteo.com" in url:
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+        return orig_urlopen(req, *args, **kwargs)
+
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen_all_openmeteo_down):
+        data = meteo_telegram_bot.parse_location_forecast(monza_loc, force_refresh=True)
+
+        print(f" -> Sorgente rilevata: {data.get('source_label')}")
+        print(f" -> Modelli attivi: {data.get('active_models')}")
+        print(f" -> Numero modelli: {data.get('model_count')}")
+
+        assert data.get("model_count", 0) == 2, f"Attesi 2 modelli indipendenti, trovati: {data.get('model_count')}"
+        assert "met_norway" in data.get("active_models", [])
+        assert "dwd_brightsky" in data.get("active_models", [])
+
+    print(" -> PASS: Degradazione a 2 modelli indipendenti senza crash validata con successo.")
+
+
+def test_diagnostica_command():
+    print("\n=== TEST 3: COMANDO /DIAGNOSTICA ===")
+    diag_text = meteo_telegram_bot.format_diagnostics_message()
+    print("Output /diagnostica:")
+    print(diag_text)
+    assert "DIAGNOSTICA STATO METEO BOT" in diag_text
+    assert "Ultimo esito Open-Meteo" in diag_text
+    assert "Memoria Cache" in diag_text
+    print(" -> PASS: Diagnostica generata correttamente.")
+
 
 if __name__ == "__main__":
-    test_hybrid_fallback_on_429()
+    test_hybrid_fallback_6_models()
+    test_hybrid_fallback_total_outage()
+    test_diagnostica_command()
+    print("\n✅ TUTTI I TEST DI RESILIENZA E MULTI-MODELLO SONO STATI SUPERATI CON SUCCESSO!")
+
