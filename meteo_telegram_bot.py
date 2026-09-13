@@ -35,7 +35,9 @@ if hasattr(sys.stdout, "reconfigure"):
 # CONFIGURAZIONE E COSTANTI
 # ==============================================================================
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
-CACHE_TTL_SECONDS = 300  # 5 minuti di cache per previsioni generali
+OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "").strip()
+CACHE_TTL_SECONDS = 900          # 15 minuti di cache per ensemble multi-modello standard
+FALLBACK_CACHE_TTL_SECONDS = 240 # 4 minuti di cache in fallback (per riagganciare Open-Meteo appena l'IP si sblocca)
 HTTP_TIMEOUT = 25
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 1.0
@@ -60,7 +62,7 @@ DEFAULT_LOCATIONS = {
     }
 }
 
-# Modelli meteorologici inclusi nell'ensemble (10 modelli globali e regionali ad alta risoluzione)
+# Modelli meteorologici inclusi nell'ensemble (10 modelli globali/regionali + modelli per fallback ibrido)
 MODELS = {
     "ecmwf_ifs025": "ECMWF (UE)",
     "dwd_icon_eu": "ICON-EU (DE)",
@@ -71,19 +73,29 @@ MODELS = {
     "jma_seamless": "JMA (JP)",
     "gem_seamless": "GEM (CA)",
     "cma_grapes_global": "CMA (CN)",
-    "bom_access_global": "BOM (AU)"
+    "bom_access_global": "BOM (AU)",
+    # Centri di calcolo per Fallback Ibrido Multi-Modello di emergenza (MET Norway + DWD Bright Sky)
+    "met_norway": "MET Norway (UE)",
+    "dwd_brightsky": "DWD ICON (DE)"
 }
 
 # Livelli di degradazione adattiva per superare i rate-limit 429 di Open-Meteo
-MODEL_TIERS = [
-    ["ecmwf_ifs025", "dwd_icon_eu", "dwd_icon", "meteofrance_seamless", "meteofrance_arpege_seamless", "gfs_global", "jma_seamless", "gem_seamless", "cma_grapes_global", "bom_access_global"],  # 10 modelli completi
-    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless", "gem_seamless", "bom_access_global"],  # 7 modelli intermedi
-    ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],  # 5 modelli consolidati
-    ["ecmwf_ifs025", "dwd_icon_eu", "gfs_global"],                                        # 3 modelli
-    ["ecmwf_ifs025", "dwd_icon_eu"],                                                       # 2 modelli
-    ["ecmwf_ifs025"],                                                                      # 1 modello (ECMWF)
-    []                                                                                     # Fallback Best Match standard
-]
+if OPEN_METEO_API_KEY:
+    MODEL_TIERS = [
+        ["ecmwf_ifs025", "dwd_icon_eu", "dwd_icon", "meteofrance_seamless", "meteofrance_arpege_seamless", "gfs_global", "jma_seamless", "gem_seamless", "cma_grapes_global", "bom_access_global"],
+        ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],
+        ["ecmwf_ifs025", "dwd_icon_eu", "gfs_global"],
+        ["ecmwf_ifs025"],
+        []
+    ]
+else:
+    # Tier ottimizzati per IP condivisi (Render.com free tier) per non superare il rate limit 429
+    MODEL_TIERS = [
+        ["ecmwf_ifs025", "dwd_icon_eu", "meteofrance_seamless", "gfs_global", "jma_seamless"],  # 5 modelli primari essenziali (ECMWF, ICON, M-France, GFS, JMA)
+        ["ecmwf_ifs025", "dwd_icon_eu", "gfs_global"],                                        # 3 modelli
+        ["ecmwf_ifs025", "dwd_icon_eu"],                                                       # 2 modelli
+        []                                                                                     # Fallback Best Match standard
+    ]
 
 GIORNI_ITA = {
     "Monday": "Lunedì",
@@ -154,16 +166,18 @@ class CacheManager:
             entry = self._cache.get(key)
             if not entry:
                 return None
-            if time.time() - entry["timestamp"] > self.ttl:
+            ttl = entry.get("ttl", self.ttl)
+            if time.time() - entry["timestamp"] > ttl:
                 del self._cache[key]
                 return None
             return entry["data"]
 
-    def set(self, key: str, data: Any) -> None:
+    def set(self, key: str, data: Any, ttl: Optional[int] = None) -> None:
         with self._lock:
             self._cache[key] = {
                 "timestamp": time.time(),
-                "data": data
+                "data": data,
+                "ttl": ttl if ttl is not None else self.ttl
             }
             self._last_known_good[key] = data
 
@@ -471,13 +485,175 @@ def fetch_met_norway_weather(lat: float, lon: float, forecast_days: int = 3) -> 
     }
 
 
+def fetch_brightsky_dwd_weather(lat: float, lon: float, forecast_days: int = 3) -> Dict[str, Dict[str, Any]]:
+    """
+    Interroga Bright Sky (API open-data del Deutscher Wetterdienst - DWD).
+    Restituisce un dizionario orario indicizzato per stringa ISO locale (es. '2026-09-13T15:00').
+    Completamente gratuito, senza API key e con limiti molto generosi.
+    """
+    now_utc = datetime.now(timezone.utc)
+    start_date = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = (now_utc + timedelta(days=forecast_days + 1)).strftime("%Y-%m-%d")
+
+    url = f"https://api.brightsky.dev/weather?lat={lat:.4f}&lon={lon:.4f}&date={start_date}&last_date={end_date}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MeteoEnsembleTelegramBot/3.0 (https://github.com/meteo; contact@pilotlab.local)"}
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+
+    slots = {}
+    weather_list = raw.get("weather", [])
+    for item in weather_list:
+        ts_str = item.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            dt_utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            month = dt_utc.month
+            tz_offset = 2 if 4 <= month <= 10 else 1
+            dt_local = dt_utc.astimezone(timezone(timedelta(hours=tz_offset))).replace(tzinfo=None)
+            slot_key = dt_local.strftime("%Y-%m-%dT%H:00")
+            slots[slot_key] = item
+        except Exception:
+            continue
+
+    return slots
+
+
+def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3) -> dict:
+    """
+    Genera un ensemble ibrido di emergenza combinando MET Norway (UE) e DWD ICON (DE tramite Bright Sky).
+    Garantisce che anche in caso di blocco HTTP 429 su Open-Meteo la media multi-modello rimanga sempre attiva (2 centri di calcolo).
+    """
+    met_data = fetch_met_norway_weather(lat, lon, forecast_days)
+    met_hourly = met_data.get("hourly", {})
+    times = met_hourly.get("time", [])
+
+    dwd_slots = {}
+    try:
+        dwd_slots = fetch_brightsky_dwd_weather(lat, lon, forecast_days)
+    except Exception as e:
+        print(f"[!] Bright Sky DWD non disponibile: {e}. Fallback su solo MET Norway.", file=sys.stderr)
+
+    if not dwd_slots:
+        met_data["_is_fallback"] = True
+        return met_data
+
+    temps_met = met_hourly.get("temperature_2m", [])
+    precips_met = met_hourly.get("precipitation", [])
+    probs_met = met_hourly.get("precipitation_probability", [])
+    rhs_met = met_hourly.get("relative_humidity_2m", [])
+    ws_met = met_hourly.get("wind_speed_10m", [])
+    wd_met = met_hourly.get("wind_direction_10m", [])
+    codes_met = met_hourly.get("weather_code", [])
+    press_met = met_hourly.get("pressure_msl", [])
+
+    temps_dwd = []
+    precips_dwd = []
+    probs_dwd = []
+    rhs_dwd = []
+    ws_dwd = []
+    wd_dwd = []
+    codes_dwd = []
+    press_dwd = []
+
+    avg_temps = []
+    avg_precips = []
+    avg_probs = []
+    avg_rhs = []
+    avg_ws = []
+    avg_press = []
+
+    for i, t_str in enumerate(times):
+        t_m = temps_met[i] if i < len(temps_met) else 20.0
+        p_m = precips_met[i] if i < len(precips_met) else 0.0
+        pr_m = probs_met[i] if i < len(probs_met) else 0.0
+        rh_m = rhs_met[i] if i < len(rhs_met) else 50.0
+        ws_m = ws_met[i] if i < len(ws_met) else 10.0
+        wd_m = wd_met[i] if i < len(wd_met) else 0.0
+        c_m = codes_met[i] if i < len(codes_met) else 0
+        pres_m = press_met[i] if i < len(press_met) else 1013.25
+
+        dwd_item = dwd_slots.get(t_str)
+        if dwd_item:
+            t_d = float(dwd_item.get("temperature") if dwd_item.get("temperature") is not None else t_m)
+            p_d = float(dwd_item.get("precipitation") if dwd_item.get("precipitation") is not None else p_m)
+            rh_d = float(dwd_item.get("relative_humidity") if dwd_item.get("relative_humidity") is not None else rh_m)
+            ws_d = float(dwd_item.get("wind_speed") if dwd_item.get("wind_speed") is not None else ws_m)
+            wd_d = float(dwd_item.get("wind_direction") if dwd_item.get("wind_direction") is not None else wd_m)
+            pres_d = float(dwd_item.get("pressure_msl") if dwd_item.get("pressure_msl") is not None else pres_m)
+            pr_d = float(dwd_item.get("precipitation_probability") if dwd_item.get("precipitation_probability") is not None else (min(90.0, 30.0 + p_d * 20.0) if p_d > 0.1 else pr_m))
+            c_d = c_m
+        else:
+            t_d, p_d, pr_d, rh_d, ws_d, wd_d, c_d, pres_d = t_m, p_m, pr_m, rh_m, ws_m, wd_m, c_m, pres_m
+
+        temps_dwd.append(t_d)
+        precips_dwd.append(p_d)
+        probs_dwd.append(pr_d)
+        rhs_dwd.append(rh_d)
+        ws_dwd.append(ws_d)
+        wd_dwd.append(wd_d)
+        codes_dwd.append(c_d)
+        press_dwd.append(pres_d)
+
+        avg_temps.append(round((t_m + t_d) / 2.0, 1))
+        avg_precips.append(round((p_m + p_d) / 2.0, 2))
+        avg_probs.append(round((pr_m + pr_d) / 2.0, 1))
+        avg_rhs.append(round((rh_m + rh_d) / 2.0, 1))
+        avg_ws.append(round((ws_m + ws_d) / 2.0, 1))
+        avg_press.append(round((pres_m + pres_d) / 2.0, 1))
+
+    return {
+        "utc_offset_seconds": 7200,
+        "_source": "Ensemble Fallback Ibrido (MET Norway + DWD ICON)",
+        "_is_fallback": True,
+        "_tier_models": ["met_norway", "dwd_brightsky"],
+        "hourly": {
+            "time": times,
+            "temperature_2m": avg_temps,
+            "precipitation": avg_precips,
+            "precipitation_probability": avg_probs,
+            "relative_humidity_2m": avg_rhs,
+            "wind_speed_10m": avg_ws,
+            "wind_direction_10m": wd_met,
+            "weather_code": codes_met,
+            "pressure_msl": avg_press,
+            "temperature_2m_met_norway": temps_met,
+            "precipitation_met_norway": precips_met,
+            "precipitation_probability_met_norway": probs_met,
+            "relative_humidity_2m_met_norway": rhs_met,
+            "wind_speed_10m_met_norway": ws_met,
+            "wind_direction_10m_met_norway": wd_met,
+            "weather_code_met_norway": codes_met,
+            "pressure_msl_met_norway": press_met,
+            "temperature_2m_dwd_brightsky": temps_dwd,
+            "precipitation_dwd_brightsky": precips_dwd,
+            "precipitation_probability_dwd_brightsky": probs_dwd,
+            "relative_humidity_2m_dwd_brightsky": rhs_dwd,
+            "wind_speed_10m_dwd_brightsky": ws_dwd,
+            "wind_direction_10m_dwd_brightsky": wd_dwd,
+            "weather_code_dwd_brightsky": codes_dwd,
+            "pressure_msl_dwd_brightsky": press_dwd
+        }
+    }
+
+
 def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
     """
-    Interroga Open-Meteo con degradazione adattiva.
+    Interroga Open-Meteo con degradazione adattiva e supporto opzionale OPEN_METEO_API_KEY.
     Se Open-Meteo risponde con 429 (blocco IP condiviso su Render) o è offline,
-    esegue automaticamente il fallback su MET Norway.
+    esegue automaticamente il fallback multi-fonte ibrido (MET Norway + DWD Bright Sky).
     """
     last_error = None
+    api_key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+    if api_key:
+        api_base = "https://customer-api.open-meteo.com/v1/forecast"
+        key_param = f"&apikey={api_key}"
+    else:
+        api_base = "https://api.open-meteo.com/v1/forecast"
+        key_param = ""
 
     for tier_idx, models_subset in enumerate(MODEL_TIERS):
         if models_subset:
@@ -486,12 +662,13 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
             models_query = ""
 
         url = (
-            f"https://api.open-meteo.com/v1/forecast"
+            f"{api_base}"
             f"?latitude={lat}&longitude={lon}"
             f"&hourly=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability,pressure_msl"
             f"{models_query}"
             f"&forecast_days={forecast_days}"
             f"&timezone=auto"
+            f"{key_param}"
         )
 
         req = urllib.request.Request(
@@ -510,7 +687,7 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
             last_error = http_err
             if http_err.code == 429:
                 print(f"[!] Rate limit HTTP 429 su Open-Meteo per {lat},{lon}. Degradazione al livello successivo...", file=sys.stderr)
-                time.sleep(0.3)
+                time.sleep(0.5)
                 continue
             elif tier_idx < len(MODEL_TIERS) - 1:
                 time.sleep(0.5)
@@ -521,12 +698,16 @@ def fetch_weather_data(lat: float, lon: float, forecast_days: int = 3) -> dict:
                 time.sleep(0.5)
                 continue
 
-    # Se Open-Meteo è bloccato (429 IP cloud) o offline, passa a MET Norway
-    print("[i] Open-Meteo non raggiungibile (429/offline). Attivazione fallback su MET Norway...", file=sys.stderr)
+    # Se Open-Meteo è bloccato (429 IP cloud) o offline, passa all'Ensemble Ibrido Multi-Modello
+    print("[i] Open-Meteo non raggiungibile (429/offline). Attivazione fallback multi-modello (MET Norway + DWD Bright Sky)...", file=sys.stderr)
     try:
-        return fetch_met_norway_weather(lat, lon, forecast_days)
-    except Exception as met_err:
-        print(f"[!] Fallback MET Norway non riuscito: {met_err}", file=sys.stderr)
+        return fetch_hybrid_fallback_weather(lat, lon, forecast_days)
+    except Exception as fallback_err:
+        print(f"[!] Fallback ibrido non riuscito: {fallback_err}. Tentativo su MET Norway singolo...", file=sys.stderr)
+        try:
+            return fetch_met_norway_weather(lat, lon, forecast_days)
+        except Exception as met_err:
+            print(f"[!] Fallback MET Norway non riuscito: {met_err}", file=sys.stderr)
 
     raise RuntimeError(f"Nessun fornitore meteo ha risposto (Open-Meteo: {last_error})")
 
@@ -834,7 +1015,10 @@ def parse_location_forecast(target: Union[str, Dict[str, Any]], force_refresh: b
         "updated_at": local_now.strftime("%d/%m/%Y alle %H:%M:%S")
     }
 
-    cache_store.set(cache_key, result_data)
+    is_fallback = raw_data.get("_is_fallback", False) or "best_match" in active_keys or len(active_keys) <= 2
+    # Cache dinamica: 4 minuti in caso di fallback/rate-limit, 15 minuti se ensemble completo Open-Meteo
+    dyn_ttl = FALLBACK_CACHE_TTL_SECONDS if is_fallback else CACHE_TTL_SECONDS
+    cache_store.set(cache_key, result_data, ttl=dyn_ttl)
     return result_data
 
 
@@ -1338,7 +1522,11 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
     )
 
     time_only = updated_at.split(" alle ")[-1][:5] if " alle " in updated_at else updated_at
-    footer = f"<i>Editoriale redatto su media multi-modello ({model_count} centri di calcolo) • Emissione delle {time_only}</i>"
+    if model_count > 1:
+        model_desc = f"media multi-modello ({model_count} centri di calcolo)"
+    else:
+        model_desc = "modello singolo (1 centro di calcolo)"
+    footer = f"<i>Editoriale redatto su {model_desc} • Emissione delle {time_only}</i>"
 
     sections = [
         f"📡 <b>EDITORIALE METEOROLOGICO SPECIALISTICO</b>\n📍 <i>{city_name.upper()} • {region_info}</i>",

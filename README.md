@@ -38,9 +38,11 @@ Il sistema aggrega in tempo reale i principali centri di calcolo mondiali e regi
 7. **CMA Grapes** - *Amministrazione Meteorologica Cinese*
 8. **BOM Access** - *Ufficio Meteorologico Australiano*
 
-### 🛡️ Doppia Sorgente Resiliente Anti-Blocco Cloud
-- **Sorgente Primaria:** Open-Meteo Ensemble con degradazione adattiva (10 -> 7 -> 5 -> 3 -> 1 modello).
-- **Fallback Istantaneo:** Supercomputer del **MET Norway (Locationforecast 2.0)**, pubblico, europeo e privo di rate-limit, attivato automaticamente in caso di errori 429 sul cloud.
+### 🛡️ Tripla Sorgente Resiliente Anti-Blocco Cloud (Media Multi-Modello Sempre Attiva)
+- **Sorgente Primaria:** Open-Meteo Ensemble con payload ottimizzato per IP condivisi (5 modelli primari essenziali o 10 modelli completi con chiave API).
+- **Fallback Ibrido Multi-Modello (100% Free):** Se Open-Meteo restituisce HTTP 429 su datacenter cloud (es. Render.com), il bot attiva istantaneamente l'ensemble ibrido combinando **MET Norway (UE)** e **DWD ICON (DE tramite Bright Sky)**, garantendo sempre la media multi-modello anche in emergenza.
+- **Supporto Opzionale API Key:** Impostando la variabile d'ambiente `OPEN_METEO_API_KEY` su Render, il bot interroga automaticamente l'endpoint dedicato `customer-api.open-meteo.com` a 10 modelli completi senza limiti di IP condiviso.
+- **Cache Dinamica:** 15 minuti su ensemble completo Open-Meteo, ridotta a 4 minuti in modalità fallback per riagganciare automaticamente la sorgente primaria appena l'IP si sblocca.
 
 ---
 
