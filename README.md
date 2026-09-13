@@ -1,61 +1,94 @@
-# Previsioni Meteo & Pioggia Multi-Modello - Putignano (BA) & Monza
+# 🌦️ Meteo Ensemble Hub & Telegram Bot Cloud 24/7
 
-Script Python autonomo ad altissima precisione che calcola e visualizza a terminale le previsioni meteorologiche orarie per **Putignano (BA)** e **Monza** (coordinate esatte: `45.566708, 9.239812`) sui prossimi 3 giorni, aggregando e confrontando **5 tra i migliori modelli meteorologici al mondo**:
+Sistema meteorologico autonomo ad altissima precisione con architettura **Multi-Modello (Ensemble fino a 10 modelli)** e doppio motore:
+1. **Bot Telegram Cloud 24/7 Standalone (`meteo_telegram_bot.py`)**: con server HTTP integrato (dashboard e healthcheck per Render/Railway), ricerca città globale, geocoding GPS, monitor allerta pioggia e bollettini avanzati.
+2. **CLI Terminale (`previsioni_pioggia_putignano.py`)**: script standalone per consultazione oraria a colori con analisi termodinamica avanzata.
 
-1. **ECMWF IFS (0.25°)** - *Centro Europeo per le Previsioni a Medio Termine* (Standard mondiale di riferimento)
-2. **DWD ICON-EU** - *Servizio Meteorologico Nazionale Tedesco* (Modello europeo ad alta risoluzione)
-3. **Météo-France Seamless** - *Servizio Meteorologico Francese*
+---
+
+## 🚀 Novità Recenti (V3.0)
+
+- **📝 Bollettino Previsioni a 3 Giorni in Stile CML (Centro Meteo Lombardo):**
+  - Formattazione descrittiva specialistica pulita (senza emoji invasive, solo marcatore `➡`).
+  - Scomposizione in fasce orarie (mattino, pomeriggio, sera) con indicazione **esplicita delle finestre orarie di pioggia** (es. *piogge attese tra le 14:00 e le 18:00 (accumulo 1.8 mm)*) o certificazione di assenza precipitazioni.
+  - Temperature minime/massime espresse con range multi-modello e trend rispetto al giorno precedente.
+  - Footer con conteggio dinamico esatto dei modelli usati per la media (es. `media 10 modelli`).
+
+- **📡 Editoriale Meteorologico Sinottico Discorsivo (Stile Twitter/X Specialistico):**
+  - Ispirato agli editoriali dei meteorologi divulgatori (stile Marco M.M. e Daniele Vasilevski).
+  - Testo approfondito (~300-400 parole) articolato in 4 paragrafi fluidi focalizzati sulla città selezionata:
+    1. *Titolo giornalistico ad effetto.*
+    2. *Inquadramento macro europeo/mediterraneo (promontorio subtropicale, saccature, palude barica).*
+    3. *Ricaduta locale al suolo (temperature, bulbo umido/afa, ventilazione e fattore notte/astronomico).*
+    4. *Segnale precipitazioni e stabilità troposferica.*
+    5. *Spaghetti ensemble multi-modello con spread termico e tendenza.*
+
+---
+
+## 🔬 Modelli Meteorologici Inclusi nell'Ensemble
+
+Il sistema aggrega in tempo reale i principali centri di calcolo mondiali e regionali:
+
+1. **ECMWF IFS (0.25°)** - *Centro Europeo per le Previsioni a Medio Termine (Standard mondiale di riferimento)*
+2. **DWD ICON-EU & ICON** - *Servizio Meteorologico Nazionale Tedesco (Alta risoluzione europea e globale)*
+3. **Météo-France Seamless & ARPEGE** - *Servizio Meteorologico Nazionale Francese*
 4. **GFS Global** - *National Oceanic and Atmospheric Administration (NOAA - USA)*
 5. **JMA Seamless** - *Agenzia Meteorologica del Giappone*
+6. **GEM Seamless** - *Servizio Meteorologico Canadese*
+7. **CMA Grapes** - *Amministrazione Meteorologica Cinese*
+8. **BOM Access** - *Ufficio Meteorologico Australiano*
+
+### 🛡️ Doppia Sorgente Resiliente Anti-Blocco Cloud
+- **Sorgente Primaria:** Open-Meteo Ensemble con degradazione adattiva (10 -> 7 -> 5 -> 3 -> 1 modello).
+- **Fallback Istantaneo:** Supercomputer del **MET Norway (Locationforecast 2.0)**, pubblico, europeo e privo di rate-limit, attivato automaticamente in caso di errori 429 sul cloud.
 
 ---
 
-## 🌟 Località Supportate
+## 📱 Bot Telegram Standalone (`meteo_telegram_bot.py`)
 
-- **Putignano (BA):** Lat 40.8505°N, Lon 17.1235°E
-- **Monza:** Lat 45.566708°N, Lon 9.239812°E (Via Valosa di Sopra 23)
-
----
-
-## 🌟 Parametri Inclusi
-
-- ☀️ **Condizione Cielo & Icona WMO** (Sereno, Parz. Nuvoloso, Pioggia debole/forte, Temporale, ecc.)
-- 🌡️ **Temperatura Reale (°C)**
-- 💧 **Temperatura di Bulbo Umido (Wet Bulb °C)** calcolata con la formula di Stull (2011) per la valutazione del comfort termico e dello stress da calore
-- 🌧️ **Precipitazioni Orarie (mm)** e **Probabilità (%)** con media ensemble e range min-max
-- 💨 **Vento** (Velocità in km/h e direzione cardinale N, NE, E, SE, S, SW, W, NW)
-- 💧 **Umidità Relativa (%)**
-- 📊 **Riepilogo Giornaliero Integrato** con confronto accumuli fra i 5 modelli e finestre di allerta pioggia
+### Funzionalità Principali
+- **Ricerca Globale:** Digita qualsiasi città (es. `Roma`, `Milano`, `Bari`, `New York`) o usa `/citta <nome>`.
+- **Posizione GPS in Tempo Reale:** Invia la posizione GPS direttamente tramite la graffetta 📎 di Telegram.
+- **Coordinate Dirette:** Supporto coordinate numeriche (es. `/coord 45.56 9.23`).
+- **Allerta Pioggia Multi-Punto:** Monitoraggio in background ogni 30 minuti su 2 località personalizzabili (`/alert_punto1`, `/alert_punto2`, `/alert_on`, `/alert_off`).
+- **Schede Interattive Inline:**
+  - `[ 🌡️ Adesso ]`: Condizione live, bulbo umido (Stull), vento e trend 3 ore.
+  - `[ ☀️ Sole & Crepuscolo ]`: Quadro astronomico NOAA (alba, tramonto, crepuscolo civile, mezzogiorno solare).
+  - `[ 📅 Previsioni 3gg ]`: Bollettino descrittivo stile CML con orari pioggia e min/max.
+  - `[ 📡 Sinottico ]`: Editoriale meteorologico divulgativo avanzato.
+  - `[ 🌧️ Solo Pioggia ]`: Filtro esclusivo sulle ore piovose.
 
 ---
 
-## 🚀 Come Eseguire
+## 💻 Utilizzo da Terminale (CLI Locale)
 
-### 1. Avvio Rapido con Menu Interattivo
-Fai doppio click su `avvia_previsioni.bat` oppure esegui:
+Esegui il batch interattivo:
 ```powershell
-py previsioni_pioggia_putignano.py
+py avvia_previsioni.bat
 ```
-Ti verrà mostrato un menu dove digitare `1` per Putignano, `2` per Monza, o `3` per entrambe le città.
+Oppure direttamente da riga di comando:
+```powershell
+# Previsioni per Monza
+py previsioni_pioggia_putignano.py --citta monza
 
-### 2. Avvio Diretto da Terminale (CLI)
-- **Solo per Monza:**
-  ```powershell
-  py previsioni_pioggia_putignano.py --citta monza
-  ```
-- **Solo per Putignano:**
-  ```powershell
-  py previsioni_pioggia_putignano.py --citta putignano
-  ```
-- **Entrambe le città:**
-  ```powershell
-  py previsioni_pioggia_putignano.py --citta entrambe
-  ```
-- **Filtra solo le ore di pioggia:**
-  ```powershell
-  py previsioni_pioggia_putignano.py --citta monza --solo-pioggia
-  ```
-- **Estendi la previsione fino a 7 giorni:**
-  ```powershell
-  py previsioni_pioggia_putignano.py --citta monza --giorni 5
-  ```
+# Previsioni per Putignano
+py previsioni_pioggia_putignano.py --citta putignano
+
+# Filtra solo le ore di pioggia
+py previsioni_pioggia_putignano.py --citta monza --solo-pioggia
+
+# Estendi la previsione fino a 5 o 7 giorni
+py previsioni_pioggia_putignano.py --citta monza --giorni 5
+```
+
+---
+
+## 🧪 Smoke Test e Validazione Automatica
+
+Il repository include una suite di collaudo automatico locale:
+```powershell
+py test_cml_bulletin.py
+```
+Verifica istantaneamente:
+- Conformità del bollettino 3gg in stile CML (assenza emoji, presenza finestre pioggia e min/max).
+- Conformità dell'editoriale sinottico (stile discorsivo, conteggio parole > 200, aderenza alla città).
