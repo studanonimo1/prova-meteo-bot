@@ -57,7 +57,7 @@ def test_hybrid_fallback_6_models():
 
 
 def test_hybrid_fallback_total_outage():
-    print("\n=== TEST 2: RESILIENZA OUTAGE TOTALE OPEN-METEO (DEGRADAZIONE A 2 MODELLI) ===")
+    print("\n=== TEST 2: RESILIENZA OUTAGE TOTALE OPEN-METEO (GARANTITI 3 MODELLI INDIPENDENTI) ===")
     monza_loc = meteo_telegram_bot.DEFAULT_LOCATIONS["monza"]
     orig_urlopen = urllib.request.urlopen
 
@@ -74,11 +74,20 @@ def test_hybrid_fallback_total_outage():
         print(f" -> Modelli attivi: {data.get('active_models')}")
         print(f" -> Numero modelli: {data.get('model_count')}")
 
-        assert data.get("model_count", 0) == 2, f"Attesi 2 modelli indipendenti, trovati: {data.get('model_count')}"
+        assert data.get("model_count", 0) >= 3, f"Attesi almeno 3 modelli indipendenti, trovati: {data.get('model_count')}"
         assert "met_norway" in data.get("active_models", [])
         assert "dwd_brightsky" in data.get("active_models", [])
+        assert "gfs_7timer" in data.get("active_models", [])
 
-    print(" -> PASS: Degradazione a 2 modelli indipendenti senza crash validata con successo.")
+        # Verifica schede in fallback totale
+        curr = meteo_telegram_bot.format_current_weather_message(data)
+        assert "Media 3 Modelli" in curr
+        assert "NOAA GFS (USA)" in curr
+
+        syn = meteo_telegram_bot.format_single_city_synoptic_message(data, monza_loc["key"])
+        assert "(3 centri di calcolo)" in syn
+
+    print(" -> PASS: Tripla ridondanza indipendente (3 modelli: UE + DE + USA) validata con successo.")
 
 
 def test_diagnostica_command():

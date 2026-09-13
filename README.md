@@ -40,15 +40,12 @@ Il sistema aggrega in tempo reale i principali centri di calcolo mondiali e regi
 
 ### 🛡️ Architettura Resiliente Anti-Blocco Cloud (Ensemble a 5 o 6 Modelli Sempre Attivo)
 - **Sorgente Primaria:** Open-Meteo Ensemble con intestazioni browser standard per superare i blocchi WAF Cloudflare sui server cloud (Render.com) aggregando 5 modelli essenziali (o 10 con API Key).
-- **Fallback Ibrido Avanzato a 6 Modelli (100% Free):** Se l'endpoint aggregato restituisce HTTP 429 su datacenter condivisi, il bot attiva un motore parallelo multithread che interroga 6 centri di calcolo indipendenti:
-  1. **MET Norway (UE)** - *api.met.no*
-  2. **DWD ICON (DE)** - *api.brightsky.dev*
-  3. **NOAA GFS (USA)** - *api.open-meteo.com/v1/gfs*
-  4. **Météo-France (FR)** - *api.open-meteo.com/v1/meteofrance*
-  5. **CMC GEM (CA)** - *api.open-meteo.com/v1/gem*
-  6. **JMA (JP)** - *api.open-meteo.com/v1/jma*
-  Garantendo sempre la media multi-modello anche in emergenza senza mai degradare a modello singolo.
-- **Resistenza a Outage Totale:** Se tutti i servizi Open-Meteo dovessero essere irraggiungibili, il sistema degrada con grazia ai server istituzionali europei (MET Norway + DWD ICON, 2 modelli).
+- **Fallback Ibrido Multi-Dominio a 3–7 Modelli (100% Free, Zero Chiavi):** Se l'endpoint Open-Meteo restituisce HTTP 429 su datacenter condivisi (es. Render.com), il bot attiva un motore parallelo multithread che interroga fornitori istituzionali su domini indipendenti:
+  1. **MET Norway (UE)** - *api.met.no* (ECMWF IFS / Arome Norvegia)
+  2. **DWD ICON (DE)** - *api.brightsky.dev* (Deutscher Wetterdienst Germania)
+  3. **NOAA GFS (USA)** - *www.7timer.info* (National Oceanic and Atmospheric Administration USA)
+  4. Centri dedicati Open-Meteo aggiuntivi (Météo-France, CMC GEM, JMA) quando raggiungibili.
+- **Tripla Ridondanza Garantita su Render:** Anche nel caso in cui l'intero dominio `open-meteo.com` sia bloccato a livello di IP, il bot aggrega SEMPRE almeno **3 centri di calcolo internazionali** (UE, DE, USA), garantendo la media multi-modello senza alcuna chiave o configurazione.
 - **Supporto Opzionale API Key:** Impostando la variabile d'ambiente `OPEN_METEO_API_KEY` su Render, il bot interroga l'endpoint dedicato `customer-api.open-meteo.com` a 10 modelli completi senza limiti di IP.
 - **Cache Dinamica:** 15 minuti su ensemble completo Open-Meteo, 4 minuti in modalità fallback per riagganciare automaticamente la sorgente primaria appena l'IP si sblocca.
 - **Comando Diagnostica Live:** `/diagnostica` (o `/status`, `/debug`) su Telegram mostra lo stato di salute dei centri di calcolo, codici HTTP e memoria cache.

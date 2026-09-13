@@ -74,9 +74,10 @@ MODELS = {
     "gem_seamless": "GEM (CA)",
     "cma_grapes_global": "CMA (CN)",
     "bom_access_global": "BOM (AU)",
-    # Centri di calcolo per Fallback Ibrido Multi-Modello di emergenza (6 modelli completi)
+    # Centri di calcolo per Fallback Ibrido Multi-Modello di emergenza
     "met_norway": "MET Norway (UE)",
     "dwd_brightsky": "DWD ICON (DE)",
+    "gfs_7timer": "NOAA GFS (USA)",
     "gfs_fallback": "GFS (USA)",
     "meteofrance_fallback": "M-France (FR)",
     "gem_fallback": "GEM (CA)",
@@ -526,6 +527,91 @@ def fetch_brightsky_dwd_weather(lat: float, lon: float, forecast_days: int = 3) 
     return slots
 
 
+def fetch_7timer_gfs_weather(lat: float, lon: float, times: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Recupera i dati del modello globale NOAA GFS (USA) tramite i server aperti di 7Timer! (www.7timer.info).
+    Non richiede API key ed è completamente indipendente dall'infrastruttura di Open-Meteo.
+    """
+    url = f"http://www.7timer.info/bin/api.pl?lon={lon:.4f}&lat={lat:.4f}&product=civil&output=json"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"}
+    )
+    with urllib.request.urlopen(req, timeout=9) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    init_str = data.get("init", "")
+    if not init_str or len(init_str) < 10:
+        return {}
+
+    init_dt = datetime.strptime(init_str[:10], "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    slots: Dict[str, Dict[str, Any]] = {}
+    prec_map = {0: 0.0, 1: 0.15, 2: 0.5, 3: 2.0, 4: 6.0, 5: 12.0, 6: 20.0, 7: 35.0, 8: 60.0, 9: 80.0}
+    speed_map = {1: 3.0, 2: 9.0, 3: 16.0, 4: 24.0, 5: 35.0, 6: 45.0, 7: 55.0, 8: 68.0}
+    dir_map = {"N": 0.0, "NE": 45.0, "E": 90.0, "SE": 135.0, "S": 180.0, "SW": 225.0, "W": 270.0, "NW": 315.0}
+
+    for pt in data.get("dataseries", []):
+        tp = pt.get("timepoint", 0)
+        pt_utc = init_dt + timedelta(hours=tp)
+        month = pt_utc.month
+        tz_off = 2 if 4 <= month <= 10 else 1
+        pt_loc = pt_utc.astimezone(timezone(timedelta(hours=tz_off))).replace(tzinfo=None)
+        key = pt_loc.strftime("%Y-%m-%dT%H:00")
+
+        t_val = safe_float(pt.get("temp2m"), 20.0)
+        rh_raw = str(pt.get("rh2m", "50%")).replace("%", "").strip()
+        try:
+            rh_val = float(rh_raw)
+        except Exception:
+            rh_val = 50.0
+        p_idx = int(pt.get("prec_amount", 0) or 0)
+        p_val = prec_map.get(p_idx, 0.0)
+        pr_val = 5.0 if p_idx == 0 else min(95.0, 20.0 + p_idx * 15.0)
+        w_dict = pt.get("wind10m", {})
+        ws_val = speed_map.get(int(w_dict.get("speed", 1) or 1), 10.0)
+        wd_val = dir_map.get(str(w_dict.get("direction", "N")).upper(), 0.0)
+
+        weather_str = str(pt.get("weather", "")).lower()
+        if "rain" in weather_str or "shower" in weather_str:
+            code_val = 61
+        elif "snow" in weather_str:
+            code_val = 71
+        elif "ts" in weather_str:
+            code_val = 95
+        elif "cloudy" in weather_str:
+            code_val = 3
+        else:
+            code_val = 0
+
+        slots[key] = {
+            "temp": t_val,
+            "precip": p_val,
+            "prob": pr_val,
+            "rh": rh_val,
+            "ws": ws_val,
+            "wd": wd_val,
+            "code": code_val,
+            "pres": 1013.25
+        }
+
+    out: Dict[str, Dict[str, Any]] = {}
+    sorted_slot_keys = sorted(slots.keys())
+    if not sorted_slot_keys:
+        return out
+
+    for t in times:
+        if t in slots:
+            out[t] = slots[t]
+        else:
+            try:
+                dt_target = datetime.fromisoformat(t)
+                closest = min(sorted_slot_keys, key=lambda k: abs((datetime.fromisoformat(k) - dt_target).total_seconds()))
+                out[t] = slots[closest]
+            except Exception:
+                pass
+    return out
+
+
 def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3) -> dict:
     """
     Genera un ensemble ibrido avanzato combinando in parallelo fino a 6 centri di calcolo indipendenti:
@@ -542,12 +628,23 @@ def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3
     met_hourly = met_data.get("hourly", {})
     times = met_hourly.get("time", [])
 
-    # 2. Recupero DWD Bright Sky
+    # 2. Recupero DWD Bright Sky e NOAA GFS (7Timer!) in parallelo
     dwd_slots = {}
-    try:
-        dwd_slots = fetch_brightsky_dwd_weather(lat, lon, forecast_days)
-    except Exception as e:
-        print(f"[!] Bright Sky DWD non disponibile: {e}", file=sys.stderr)
+    gfs_7timer_slots = {}
+
+    def _fetch_dwd():
+        nonlocal dwd_slots
+        try:
+            dwd_slots = fetch_brightsky_dwd_weather(lat, lon, forecast_days)
+        except Exception as e:
+            print(f"[!] Bright Sky DWD non disponibile: {e}", file=sys.stderr)
+
+    def _fetch_7timer():
+        nonlocal gfs_7timer_slots
+        try:
+            gfs_7timer_slots = fetch_7timer_gfs_weather(lat, lon, times)
+        except Exception as e:
+            print(f"[!] 7Timer NOAA GFS non disponibile: {e}", file=sys.stderr)
 
     # 3. Interrogazione parallela degli endpoint dedicati con header browser standard
     browser_headers = {
@@ -584,10 +681,12 @@ def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3
                             "pres": safe_float(h.get("pressure_msl", [None])[idx_t], 1013.25)
                         }
                     dedicated_results[model_name] = model_dict
-        except Exception as err:
+        except Exception:
             pass
 
     threads = [
+        threading.Thread(target=_fetch_dwd),
+        threading.Thread(target=_fetch_7timer),
         threading.Thread(target=_fetch_dedicated, args=("gfs_fallback", "gfs")),
         threading.Thread(target=_fetch_dedicated, args=("meteofrance_fallback", "meteofrance")),
         threading.Thread(target=_fetch_dedicated, args=("gem_fallback", "gem")),
@@ -602,6 +701,8 @@ def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3
     active_models = ["met_norway"]
     if dwd_slots:
         active_models.append("dwd_brightsky")
+    if gfs_7timer_slots:
+        active_models.append("gfs_7timer")
     for d_name in dedicated_results.keys():
         active_models.append(d_name)
 
@@ -679,7 +780,38 @@ def fetch_hybrid_fallback_weather(lat: float, lon: float, forecast_days: int = 3
             hour_ws.append(ws_d)
             hour_pres.append(pres_d)
 
-        # 3. Dedicated models
+        # 3. NOAA GFS (7Timer!)
+        if "gfs_7timer" in active_models:
+            gfs_item = gfs_7timer_slots.get(t_str)
+            if gfs_item:
+                t_g = float(gfs_item["temp"])
+                p_g = float(gfs_item["precip"])
+                pr_g = float(gfs_item["prob"])
+                rh_g = float(gfs_item["rh"])
+                ws_g = float(gfs_item["ws"])
+                wd_g = float(gfs_item["wd"])
+                c_g = int(gfs_item["code"])
+                pres_g = float(gfs_item["pres"])
+            else:
+                t_g, p_g, pr_g, rh_g, ws_g, wd_g, c_g, pres_g = t_m, p_m, pr_m, rh_m, ws_m, wd_m, c_m, pres_m
+
+            model_series["gfs_7timer"]["temps"].append(t_g)
+            model_series["gfs_7timer"]["precips"].append(p_g)
+            model_series["gfs_7timer"]["probs"].append(pr_g)
+            model_series["gfs_7timer"]["rhs"].append(rh_g)
+            model_series["gfs_7timer"]["ws"].append(ws_g)
+            model_series["gfs_7timer"]["wd"].append(wd_g)
+            model_series["gfs_7timer"]["codes"].append(c_g)
+            model_series["gfs_7timer"]["pres"].append(pres_g)
+
+            hour_temps.append(t_g)
+            hour_precips.append(p_g)
+            hour_probs.append(pr_g)
+            hour_rhs.append(rh_g)
+            hour_ws.append(ws_g)
+            hour_pres.append(pres_g)
+
+        # 4. Dedicated models
         for d_name, d_map in dedicated_results.items():
             item = d_map.get(t_str)
             if item:
