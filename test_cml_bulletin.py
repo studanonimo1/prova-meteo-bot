@@ -45,8 +45,21 @@ def run_test():
         forbidden_emojis = ["☀️", "🌧️", "🌤️", "⛅", "☁️", "💨", "💧", "🌡️", "🔬", "📍", "📅"]
         for emo in forbidden_emojis:
             assert emo not in bulletin, f"Rilevata emoji non consentita: {emo}"
+        # Test Editoriale Sinottico Specialistico (Stile Twitter/X)
+        synoptic_msg = meteo_telegram_bot.format_single_city_synoptic_message(data, loc["key"])
+        print(f"\n--- EDITORIALE SINOTTICO DISCORSO PER {loc['name']} ---")
+        print(synoptic_msg)
+        print(f"------------------------------------------------------------")
 
-    print("\n✅ TUTTI I TEST SUPERATI CON SUCCESSO! Il bollettino è conforme alle specifiche CML e privo di emoji.")
+        word_count = len(synoptic_msg.split())
+        print(f"[i] Conteggio parole editoriale per {loc['name']}: {word_count} parole.")
+        assert word_count >= 180, f"Editoriale troppo breve: {word_count} parole (atteso >= 180)"
+        assert "EDITORIALE METEOROLOGICO SPECIALISTICO" in synoptic_msg
+        assert "1. ASSETTO BARICO" not in synoptic_msg, "Rilevato vecchio schema a punti elenco 1. ASSETTO BARICO"
+        assert "2. DIAGNOSI MASSA D'ARIA" not in synoptic_msg, "Rilevato vecchio schema a punti elenco 2. DIAGNOSI"
+        assert loc["name"] in synoptic_msg, f"Nome città {loc['name']} non presente nell'editoriale"
+
+    print("\n✅ TUTTI I TEST SUPERATI CON SUCCESSO! Il bollettino CML e l'editoriale sinottico sono conformi.")
 
 if __name__ == "__main__":
     run_test()

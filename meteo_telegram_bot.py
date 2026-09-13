@@ -1179,14 +1179,8 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
 
 def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -> str:
     """
-    Genera un bollettino meteorologico sinottico professionale ad alto contenuto specialistico (stile aeronautico).
-    Analizza dinamicamente per qualsiasi località:
-    1. Inquadramento barico e gradienti isobarici (SLP, tendenza 72h).
-    2. Diagnosi termodinamica della massa d'aria dominante (origine, temperatura potenziale, contenuto igrometrico).
-    3. Indice di stabilità e finestra temporale esatta dell'eventuale cambiamento di tempo.
-    4. Regime anemometrico al suolo, rotazioni e turbolenza nello strato limite.
-    5. Grado di convergenza/dispersione dell'Ensemble multi-modello (affidabilità).
-    6. Note operative e sintesi del bollettino.
+    Genera un editoriale meteorologico specialistico e divulgativo in stile Twitter/X (stile Marco M.M. / Daniele Vasilevski).
+    Articolato in 4 paragrafi narrativi continui, fluidi e appassionati, focalizzati sui dati fisici reali della città selezionata.
     """
     loc = data["loc"]
     m = data.get("metrics", {})
@@ -1210,205 +1204,153 @@ def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -
 
     # 1. Direzione dominante del vento nelle 72h
     wind_dirs = [h.get("wind_dir", "N") for h in hours if h.get("wind_dir")]
-    dominant_wind = max(set(wind_dirs), key=wind_dirs.count) if wind_dirs else "Variabile"
+    dominant_wind = max(set(wind_dirs), key=wind_dirs.count) if wind_dirs else "E"
+    dominant_wind_ita = CARDINAL_TO_ITA_WIND.get(dominant_wind, "orientali")
 
-    # 2. Diagnosi Figura Barica Dominante
-    if avg_p >= 1021.0:
-        baric_type = "Promontorio Anticiclonico di Blocco strutturato"
-        baric_desc = (
-            f"La colonna atmosferica su {loc['name']} è governata da una solida cella anticiclonica "
-            f"(pressione media stimata: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
-            f"I moti subsidenti discendenti comprimono l'aria verso il suolo, inibendo sul nascere "
-            f"lo sviluppo di moti convettivi verticali e garantendo un esteso scudo protettivo."
-        )
-    elif avg_p >= 1016.0:
-        baric_type = "Campo Anticiclonico a Gradiente Debole"
-        baric_desc = (
-            f"Assetto barico dominato da un'area di alta pressione moderatamente livellata "
-            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
-            f"Condizioni di generale stabilità al suolo, con modesto gradiente barico orizzontale e "
-            f"scarse perturbazioni a larga scala, salvo deboli ondulazioni termiche diurne."
-        )
-    elif avg_p >= 1012.0:
-        baric_type = "Palude Barica / Circolazione Ciclica Livellata"
-        baric_desc = (
-            f"Configurazione barica debolmente livellata priva di centri di alta o bassa pressione dominanti "
-            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
-            f"Tale assetto favorisce un modesto accumulo di umidità nei bassi strati con formazione di cumuli pomeridiani "
-            f"in corrispondenza del riscaldamento diurno o di convergenze orografiche locali."
-        )
-    elif avg_p >= 1007.0:
-        baric_type = "Saccatura Depressionaria in Avanzamento"
-        baric_desc = (
-            f"Progressiva flessione del campo di geopotenziale con inserimento di una saccatura atlantica "
-            f"(pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
-            f"L'afflusso di aria progressivamente più fresca in quota genera un gradiente termico verticale favorevole "
-            f"all'attivazione di contrasti convettivi e linee di instabilità organizzata."
-        )
-    else:
-        baric_type = "Vortice Ciclonico / Minimo Depressionario Attivo"
-        baric_desc = (
-            f"Regime di bassa pressione marcata (pressione media: <code>{avg_p:.1f} hPa</code> | attuale: <code>{cur_p:.1f} hPa</code>). "
-            f"Presenza di un fitto gradiente barico orizzontale con ventilazione vivace, convergenza al suolo "
-            f"e transito di corpi nuvolosi frontali forieri di precipitazioni diffuse."
-        )
-
-    # Tendenza Barica (Trend 72h)
-    if p_delta <= -4.0:
-        baric_trend = f"🔻 <b>Tendenza Barica (72h):</b> <b>Flessione barica pronunciata</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): indica l'approssimarsi di una discontinuità frontale o di una saccatura in avvicinamento."
-    elif p_delta >= 4.0:
-        baric_trend = f"🔺 <b>Tendenza Barica (72h):</b> <b>Rimonta pressoria consistente</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): segnala un consolidamento progressivo della struttura anticiclonica con netto miglioramento."
-    else:
-        baric_trend = f"⚖️ <b>Tendenza Barica (72h):</b> <b>Sostanziale stazionarietà barica</b> (<code>{p_delta:+.1f} hPa</code> nelle 72h): oscillazioni fisiologiche legate al ciclo di marea atmosferica diurna senza rotture sinottiche violente."
-
-    # 3. Diagnosi Massa d'Aria & Contenuto Termo-Igrometrico
-    is_meridional = any(d in dominant_wind for d in ["S", "SE", "SW"])
-    is_northern = any(d in dominant_wind for d in ["N", "NE", "NW"])
-
-    if max_t >= 31.0 or max_wb >= 24.0:
-        air_mass_type = "Subtropicale Continentale (Matrice Nord-Africana)"
-        air_mass_desc = (
-            f"Flusso a matrice sahariana con risalita di aria calda in quota e forte riscaldamento superficiale. "
-            f"Il profilo verticale evidenzia temperature di picco a <code>{max_t:.1f}°C</code> e bulbo umido elevato "
-            f"(Tw max <code>{max_wb:.1f}°C</code>), responsabile di afa percepita e accumulo di energia termica potenziale."
-        )
-    elif max_t >= 27.0 and is_meridional:
-        air_mass_type = "Subtropicale Marittima Mediterranea"
-        air_mass_desc = (
-            f"Massa d'aria calda ma ricca di umidità nei bassi strati trasportata da correnti meridionali "
-            f"(quadrante prevalente: <code>{dominant_wind}</code>). "
-            f"Sensazione di calore umido con escursione termica contenuta e tendenza a foschie nelle ore notturne."
-        )
-    elif avg_t <= 12.0 or (min_t <= 6.0 and is_northern):
-        air_mass_type = "Polare Continentale / Artica Marittima"
-        air_mass_desc = (
-            f"Circolazione alimentata da aria densa, fredda e limpida di provenienza settentrionale. "
-            f"Notevole escursione termica (minima <code>{min_t:.1f}°C</code>, massima <code>{max_t:.1f}°C</code>), "
-            f"basso punto di rugiada e sensazione di freddo acuita dalla ventilazione (wind chill)."
-        )
-    elif tot_r >= 4.0 or max_pr >= 45.0:
-        air_mass_type = "Marittima Oceanica Instabile (Atlantica)"
-        air_mass_desc = (
-            f"Massa d'aria temperata ma marcatamente umida e instabile proveniente dai quadranti atlantici. "
-            f"Elevato gradiente di vapore acqueo con frequenti addensamenti nuvolosi, rovesci intermittenti "
-            f"(cumulato stimato: <code>{tot_r:.1f} mm</code>) e vivace turbolenza dinamica."
-        )
-    else:
-        air_mass_type = "Temperata di Transizione Continentale"
-        air_mass_desc = (
-            f"Massa d'aria in buon equilibrio termico con le medie climatiche stagionali "
-            f"(temperatura media: <code>{avg_t:.1f}°C</code>, minima: <code>{min_t:.1f}°C</code>, massima: <code>{max_t:.1f}°C</code>). "
-            f"Valori di bulbo umido confortevoli (<code>{max_wb:.1f}°C</code>) con modesta turbolenza e buona qualità dell'aria."
-        )
-
-    # 4. Analisi di Stabilità & Quadro Piogge su 72 Ore (Giorno per Giorno)
-    daily_stats = data.get("daily", {})
-    rain_days_info = []
-
-    for d_label, d_info in daily_stats.items():
-        tot_mm = d_info.get("total_mm_avg", 0.0)
-        max_prob = d_info.get("max_prob", 0.0)
-        r_slots = d_info.get("rain_slots", [])
-        
-        # Filtra slot con pioggia effettiva (>= 0.1mm o probabilità significativa >= 30%)
-        sig_slots = [s for s in r_slots if s.get("mm", 0.0) >= 0.1 or s.get("prob", 0.0) >= 30.0]
-        
-        if sig_slots and (tot_mm >= 0.2 or max_prob >= 35.0):
-            first_h = sig_slots[0]["hour"]
-            last_h = sig_slots[-1]["hour"]
-            time_window = f"dalle ore {first_h} alle {last_h}" if first_h != last_h else f"attorno alle ore {first_h}"
-            rain_days_info.append(
-                f"• 🌧️ <b>{d_label}:</b> <b>Pioggia attesa {time_window}</b> "
-                f"(accumulo stimato: <code>{tot_mm:.1f} mm</code>, picco probabilità: <code>{max_prob:.0f}%</code>)"
-            )
-        else:
-            rain_days_info.append(
-                f"• ☀️ <b>{d_label}:</b> <i>Asciutto / Nessuna pioggia prevista</i> (picco prob: <code>{max_prob:.0f}%</code>)"
-            )
-
-    has_rain_any_day = any("🌧️" in line for line in rain_days_info)
-    if has_rain_any_day:
-        stability_status = "Instabilità con Precipitazioni Previste"
-        timing_desc = (
-            f"🌧️ <b>PROIEZIONE PIOGGE NELLE 72 ORE:</b>\n" +
-            "\n".join(rain_days_info) + "\n"
-            f"• <i>Dinamica generale:</i> Passaggi nuvolosi forieri di rovesci intermittenti. "
-            f"Consultare il dettaglio orario nella scheda [📅 Previsioni 3gg] per la sequenza dei fenomeni."
-        )
-    else:
-        stability_status = "Stabilità Continua (Nessun Peggioramento)"
-        timing_desc = (
-            f"☀️ <b>NESSUNA PIOGGIA PREVISTA NELLE PROSSIME 72 ORE:</b>\n" +
-            "\n".join(rain_days_info) + "\n"
-            f"• <i>Dinamica generale:</i> La colonna troposferica resta protetta dal campo di alta pressione, "
-            f"con assenza totale di piogge organizzate e condizioni favorevoli per tutte le attività all'aperto."
-        )
-
-    # 5. Ventilazione & Circolazione Anemometrica
-    wind_analysis = (
-        f"• <b>Flusso Prevalente:</b> Quadrante <code>{dominant_wind}</code> (intensità media: <code>{avg_ws:.1f} km/h</code>).\n"
-        f"• <b>Picco Massimo di Raffica:</b> Stimato a <code>{max_ws:.1f} km/h</code>.\n"
-        f"• <b>Regime di Brezza:</b> Circolazione modulata dal riscaldamento diurno con brezze termiche nel pomeriggio "
-        f"e successiva attenuazione serale per inversione termica superficiale."
-    )
-
-    # 6. Affidabilità Predittiva Multi-Modello
     model_count = len(active_m) if active_m and "best_match" not in active_m else 1
     active_model_names = [MODELS.get(k, k) for k in active_m if k in MODELS]
-    models_summary_label = ", ".join(active_model_names[:5]) + (f" e altri {len(active_model_names)-5}" if len(active_model_names) > 5 else "")
+    models_summary = ", ".join(active_model_names[:4]) + (f" e altri {len(active_model_names)-4}" if len(active_model_names) > 4 else "")
 
-    if model_spread < 1.8 and model_count > 1:
-        confidence_badge = "🟢 ELEVATA (Consenso ≥ 90%)"
-        confidence_desc = (
-            f"I {model_count} modelli meteorologici dell'ensemble ({models_summary_label}) convergono con precisione "
-            f"elevata sulla traiettoria barica e sull'evoluzione termica (spread massimo limitato a <code>{model_spread:.1f}°C</code>). "
-            f"Previsione ad alta affidabilità."
+    city_name = loc["name"]
+    region_info = loc.get("desc", loc.get("region", ""))
+
+    # --- TITOLO EDITORIALE AD EFFETTO ---
+    if avg_p >= 1019.0 and max_t >= 30.0:
+        titolo = f"La cupola anticiclonica non molla la presa: stabilità diffusa e caldo sopra media su {city_name}."
+    elif avg_p >= 1018.0 and max_t < 30.0:
+        titolo = f"L'anticiclone garantisce bel tempo e stabilità: quadro pienamente godibile per {city_name}."
+    elif avg_p >= 1014.0 and p_delta <= -2.0:
+        titolo = f"L'Atlantico tenta il blitz: prime crepe sull'alta pressione e graduale flessione barica su {city_name}."
+    elif avg_p >= 1014.0:
+        titolo = f"Palude barica e contrasti termici locali: giornate stabili ma con variabilità diurna su {city_name}."
+    elif tot_r >= 3.0 or max_pr >= 50.0:
+        titolo = f"L'affondo depressionario entra nel vivo: fase perturbata e finestra di piogge in arrivo su {city_name}."
+    else:
+        titolo = f"Correnti oceaniche e variabilità: transito di corpi nuvolosi in un contesto termico dinamico su {city_name}."
+
+    # --- PARAGRAFO 1: INQUADRAMENTO SINOTTICO MACRO & DINAMICA DELLE MASSE D'ARIA ---
+    if avg_p >= 1019.0:
+        if p_delta >= 1.0:
+            p1 = (
+                f"Il quadro sinottico a scala europea è saldamente governato da una possente struttura altopressoria "
+                f"che dalle latitudini subtropicali si protende verso il Mediterraneo centrale e l'Italia. "
+                f"Un vero e proprio muro barico (pressione media calcolata attorno a <b>{avg_p:.1f} hPa</b> su {city_name}) "
+                f"che agisce come uno scudo impermeabile contro gli affondi atlantici, costringendo le perturbazioni oceaniche "
+                f"a scorrere a latitudini ben più settentrionali. I moti subsidenti discendenti comprimono l'aria verso il suolo, "
+                f"inibendo sul nascere lo sviluppo verticale delle nubi e garantendo una fase di diffusa e persistente stabilità atmosferica."
+            )
+        elif p_delta <= -2.0:
+            p1 = (
+                f"L'interazione tra la calda struttura anticiclonica mediterranea e le correnti atlantiche sta entrando in una fase "
+                f"particolarmente dinamica. Il promontorio subtropicale resiste ancora con tenacia, ma sul bordo occidentale e settentrionale "
+                f"si notano le prime ondulazioni della corrente a getto: il geopotenziale è in lenta e progressiva flessione su {city_name} "
+                f"(pressione media a <b>{avg_p:.1f} hPa</b> con un trend nelle 72 ore pari a <b>{p_delta:+.1f} hPa</b>). "
+                f"Non siamo davanti a un improvviso ribaltone autunnale o a una rottura stagionale netta, ma l'anticiclone inizia a mostrare "
+                f"i primi fisiologici segnali di stanchezza lasciando filtrare aria più instabile in quota."
+            )
+        else:
+            p1 = (
+                f"La configurazione atmosferica a grande scala vede il Mediterraneo centrale e l'Italia inseriti in una vasta area "
+                f"anticiclonica a gradiente debole (pressione media su {city_name} pari a <b>{avg_p:.1f} hPa</b>). "
+                f"Si tratta di una situazione di blocco classico in cui la massa d'aria staziona per più giorni, tenendo a debita distanza "
+                f"i fronti perturbati oceanici e garantendo condizioni di diffusa protezione anticiclonica."
+            )
+    elif avg_p >= 1013.0:
+        p1 = (
+            f"Siamo davanti a una classica configurazione a palude barica con gradiente orizzontale poco pronunciato "
+            f"(pressione media stimata attorno a <b>{avg_p:.1f} hPa</b> su {city_name}). "
+            f"In questo assetto l'atmosfera funziona come una fisarmonica: l'Atlantico affonda verso la Penisola Iberica e la risposta calda "
+            f"risale verso est, lasciando il nostro Paese in una terra di mezzo dove si alternano infiltrazioni più fresche in quota "
+            f"e risalite calde nei bassi strati, con moti convettivi pomeridiani a ridosso dell'orografia."
+        )
+    else:
+        p1 = (
+            f"Una profonda saccatura atlantica è riuscita ad affondare la lama verso il Mediterraneo centrale, scavando un vortice "
+            f"depressionario strutturato (pressione media su {city_name} in marcata discesa a <b>{avg_p:.1f} hPa</b>). "
+            f"Il richiamo di correnti umide meridionali associato all'avanzata della linea di discontinuità frontale innesca contrasti "
+            f"termici verticali pronunciati, determinando una fase perturbata con corpi nuvolosi forieri di fenomeni diffusi."
+        )
+
+    # --- PARAGRAFO 2: RICADUTA TERMICA LOCALE PER LA CITTÀ & FATTORE NOTTE/ASTRONOMICO ---
+    delta_t = max_t - min_t
+    if max_wb >= 27.0:
+        stress_desc = "marcatamente afoso nelle ore centrali del giorno, con elevato contenuto igrometrico e sensazione di calore percepito"
+    elif max_wb >= 23.0:
+        stress_desc = "caldo estivo ma con indice di disagio tollerabile grazie alla buona ventilazione"
+    elif max_wb <= 16.0:
+        stress_desc = "decisamente fresco e frizzante, con aria limpida e asciutta"
+    else:
+        stress_desc = "termicamente gradevole ed equilibrato, privo di eccessi di calore o afa opprimente"
+
+    p2 = (
+        f"Al suolo, per l'area di <b>{city_name}</b>, questa dinamica si traduce in una forbice termica caratterizzata da valori massimi "
+        f"diurni che toccheranno i <b>{max_t:.1f}°C</b>, a fronte di minime notturne sui <b>{min_t:.1f}°C</b> (escursione termica di circa {delta_t:.1f}°C). "
+        f"Il profilo igrometrico delinea un contesto {stress_desc}. "
+        f"La ventilazione al suolo rimarrà prevalentemente orientata dai quadranti <b>{dominant_wind_ita}</b>, con velocità media di {avg_ws:.0f} km/h "
+        f"e locali raffiche pomeridiane fino a {max_ws:.0f} km/h a regime di brezza. "
+        f"Un alleato prezioso in questo periodo è il fattore calendario: le giornate che si accorciano e l'allungamento delle ore notturne "
+        f"consentono al suolo di disperdere calore per irraggiamento in modo molto più efficace rispetto al cuore dell'estate, favorendo un rapido "
+        f"raffreddamento serale non appena il sole tramonta."
+    )
+
+    # --- PARAGRAFO 3: SEGNALE DELLE PRECIPITAZIONI & STABILITÀ ---
+    if tot_r < 0.2 and max_pr < 30.0:
+        p3 = (
+            f"Anche il segnale delle precipitazioni, almeno per l'orizzonte previsionale a 72 ore, resta del tutto assente. "
+            f"Non si scorge alcuna traccia di perturbazioni organizzate né passaggi capaci di cambiare in modo deciso il quadro "
+            f"atmosferico su {city_name}: la colonna troposferica rimarrà protetta da una marcata compressione subsidente, lasciando spazio "
+            f"soltanto a innocui passaggi di velature semitrasparenti o a modesti cumuli pomeridiani del tutto sterili. "
+            f"Tempo asciutto garantito senza sorprese."
+        )
+    else:
+        p3 = (
+            f"Sul fronte delle precipitazioni il segnale modellistico evidenzia invece una fase più instabile. "
+            f"La convergenza nei bassi strati e l'infiltrazione di correnti più fresche in quota aprono una finestra temporale favorevole "
+            f"a piogge e rovesci (accumulo complessivo stimato in circa <b>{tot_r:.1f} mm</b>, con picco di probabilità al <b>{max_pr:.0f}%</b>). "
+            f"Non si tratterà necessariamente di un maltempo continuo e persistente, bensì di passaggi instabili a tratti vivaci "
+            f"che meritano attenzione. I dettagli orari della sequenza fenologica sono consultabili nella scheda [📅 Previsioni 3gg]."
+        )
+
+    # --- PARAGRAFO 4: SPAGHETTI ENSEMBLE, ACCORDO MODELLISTICO & TENDENZA ---
+    if model_spread < 2.0 and model_count > 1:
+        spread_desc = (
+            f"Gli spaghetti ensemble dei <b>{model_count} modelli internazionali</b> ({models_summary}) mostrano un grado di convergenza "
+            f"straordinariamente compatto: lo spread termico tra i diversi scenari a 72 ore è contenuto ad appena <b>{model_spread:.1f}°C</b>, "
+            f"a riprova di una previsione ad elevatissima attendibilità."
         )
     elif model_spread < 3.2:
-        confidence_badge = "🟡 BUONA / MEDIA (Consenso ≈ 75%)"
-        confidence_desc = (
-            f"Accordo generale tra i modelli sui tratti barici salienti; permangono modeste divergenze orarie "
-            f"sull'esatta entità dei picchi termici massimi (spread di <code>{model_spread:.1f}°C</code> tra i modelli dell'ensemble)."
+        spread_desc = (
+            f"Il fascio degli ensemble dei <b>{model_count} modelli meteorologici</b> ({models_summary}) mostra un buon accordo complessivo sui "
+            f"tratti salienti, con uno spread termico medio di <b>{model_spread:.1f}°C</b> legato a minime incertezze sull'esatta intensità "
+            f"dei flussi termici al suolo."
         )
     else:
-        confidence_badge = "🟠 MEDIO-BASSA (Dispersione Modellistica)"
-        confidence_desc = (
-            f"I modelli evidenziano sensibili discrepanze sulla velocità di penetrazione delle masse d'aria "
-            f"(spread termico di <code>{model_spread:.1f}°C</code>). Seguire i prossimi aggiornamenti."
+        spread_desc = (
+            f"Il grafico degli spaghetti ensemble evidenzia una certa dispersione tra le diverse corse (spread termico di <b>{model_spread:.1f}°C</b>), "
+            f"segnale che la traiettoria precisa dei nuclei d'aria presenta margini di variabilità che andranno confermati con i prossimi run."
         )
 
-    # 7. Note Operative & Sintesi
-    if tot_r > 3.0:
-        op_summary = "Fase instabile con finestre di pioggia: pianificare le attività all'aperto monitorando gli orari di precipitazione."
-    elif max_t >= 32.0:
-        op_summary = "Regime caldo-afoso esteso: limitare l'esposizione diretta nelle ore centrali del dì (picco UV e stress da afa)."
-    elif max_ws >= 30.0:
-        op_summary = "Ventilazione vivace a tratti tesa: prestare attenzione alle raffiche improvvise su aree esposte."
-    else:
-        op_summary = "Condizioni meteorologiche ottimali e stabili: via libera senza limitazioni per spostamenti ed attività esterne."
+    p4 = (
+        f"{spread_desc} "
+        f"Guardando alla tendenza successiva, la circolazione generale sembra orientata a mantenere questo assetto prima di un possibile "
+        f"nuovo rimescolamento delle correnti. Continueremo a monitorare costantemente le uscite dei principali centri di calcolo per cogliere "
+        f"tempestivamente ogni eventuale variazione."
+    )
 
-    out = [
-        "📡 <b>BOLLETTINO METEOROLOGICO SINOTTICO PROFESSIONALE</b>",
-        f"🏙️ <b>{loc['name'].upper()}</b>",
-        f"📍 <i>{loc.get('desc', loc.get('region', ''))}</i>",
-        f"⏱️ <i>Emissione: {updated_at} • Orizzonte: 72 Ore (Modelli Ensemble)</i>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🧭 <b>1. ASSETTO BARICO & ISOBARICO:</b>",
-        f"• <b>Figura Dominante:</b> <i>{baric_type}</i>\n{baric_desc}",
-        f"{baric_trend}\n",
-        f"🌡️ <b>2. DIAGNOSI MASSA D'ARIA & TERMODINAMICA:</b>",
-        f"• <b>Tipologia:</b> <i>{air_mass_type}</i>\n{air_mass_desc}\n",
-        f"⏳ <b>3. STABILITÀ & LINEA DI CAMBIAMENTO:</b>",
-        f"• <b>Stato Troposferico:</b> <i>{stability_status}</i>\n{timing_desc}\n",
-        f"💨 <b>4. DINAMICA ANEMOMETRICA AL SUOLO:</b>",
-        f"{wind_analysis}\n",
-        f"🔬 <b>5. AFFIDABILITÀ PREDITTIVA MULTI-MODELLO:</b>",
-        f"• <b>Indice di Accordo:</b> {confidence_badge}\n{confidence_desc}\n",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📋 <b>GIUDIZIO DI SINTESI OPERATIVA:</b>\n<i>{op_summary}</i>\n",
-        f"🕒 <i>Bollettino elaborato con integrazione Ensemble Multi-Modello (10 centri meteo internazionali)</i>"
+    time_only = updated_at.split(" alle ")[-1][:5] if " alle " in updated_at else updated_at
+    footer = f"<i>Editoriale redatto su media multi-modello ({model_count} centri di calcolo) • Emissione delle {time_only}</i>"
+
+    sections = [
+        f"📡 <b>EDITORIALE METEOROLOGICO SPECIALISTICO</b>\n📍 <i>{city_name.upper()} • {region_info}</i>",
+        f"<b>{titolo}</b>",
+        p1,
+        p2,
+        p3,
+        p4,
+        footer
     ]
-    return "\n".join(out)
+
+    return "\n\n".join(sections)
 
 
 def format_sun_times_message(data: Dict[str, Any]) -> str:
