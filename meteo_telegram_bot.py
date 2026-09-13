@@ -95,6 +95,19 @@ GIORNI_ITA = {
     "Sunday": "Domenica"
 }
 
+MESI_ITA = {
+    1: "gennaio", 2: "febbraio", 3: "marzo", 4: "aprile",
+    5: "maggio", 6: "giugno", 7: "luglio", 8: "agosto",
+    9: "settembre", 10: "ottobre", 11: "novembre", 12: "dicembre"
+}
+
+CARDINAL_TO_ITA_WIND = {
+    "N": "settentrionali", "NNE": "settentrionali", "NE": "nord-orientali", "ENE": "orientali",
+    "E": "orientali", "ESE": "orientali", "SE": "sud-orientali", "SSE": "meridionali",
+    "S": "meridionali", "SSW": "meridionali", "SW": "sud-occidentali", "WSW": "occidentali",
+    "W": "occidentali", "WNW": "occidentali", "NW": "nord-occidentali", "NNW": "settentrionali"
+}
+
 WMO_WEATHER_CODES = {
     0: ("☀️", "Sereno"),
     1: ("🌤️", "Preval. Sereno"),
@@ -909,73 +922,255 @@ def format_current_weather_message(data: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def generate_cml_synoptic_overview(data: Dict[str, Any]) -> str:
+    """Genera un inquadramento sinottico sintetico (1-2 frasi) derivato dai campi barici dell'ensemble."""
+    m = data.get("metrics", {})
+    avg_p = m.get("avg_pressure", 1015.0)
+    p_delta = m.get("pressure_delta", 0.0)
+    total_r = m.get("total_rain", 0.0)
+    max_pr = m.get("max_rain_prob", 0.0)
+
+    if avg_p >= 1020.0:
+        if p_delta >= 1.0:
+            return (
+                "Progressivo ed ulteriore consolidamento sull'Europa centro-occidentale di un campo altopressorio, "
+                "che continuerà a garantire bel tempo ancora per qualche giorno, con temperature in aumento "
+                "raggiungendo valori gradevoli senza eccessi."
+            )
+        elif p_delta <= -2.5:
+            return (
+                "Struttura anticiclonica ancora dominante sul Mediterraneo ma con primi segnali di cedimento "
+                "del geopotenziale in quota, preludio ad una modesta accentuazione dell'instabilità pomeridiana; "
+                "in pianura permangono condizioni diffusamente stabili e asciutte."
+            )
+        else:
+            return (
+                "Persistenza di un solido promontorio anticiclonico che continua a garantire tempo stabile "
+                "e soleggiato su tutto il territorio, con cieli sereni o poco nuvolosi e temperature stazionarie."
+            )
+    elif avg_p >= 1015.0:
+        if total_r < 1.0 and max_pr < 35.0:
+            return (
+                "Campo di alta pressione a gradiente debole sul bacino centrale del Mediterraneo, "
+                "sufficiente a mantenere condizioni di generale stabilità con cieli sereni o poco nuvolosi, "
+                "salvo temporanee velature e consuete brezze termiche pomeridiane."
+            )
+        else:
+            return (
+                "Assetto barico debolmente anticiclonico insidiato da modeste infiltrazioni di aria più fresca "
+                "in quota, con sviluppo di addensamenti cumuliformi pomeridiani associati a possibili locali piovaschi."
+            )
+    elif avg_p >= 1011.0:
+        if total_r >= 3.0 or max_pr >= 45.0:
+            return (
+                "Circolazione debolmente instabile associata a un flusso atlantico ondulato nei medi strati, "
+                "favorevole ad annuvolamenti irregolari forieri di piogge o rovesci intermittenti."
+            )
+        else:
+            return (
+                "Configurazione barica debolmente livellata priva di figure dominanti, con alternanza di ampie schiarite "
+                "e modesti passaggi nuvolosi in un contesto termico allineato alle medie stagionali."
+            )
+    else:
+        if p_delta <= -2.0:
+            return (
+                "Approfondimento di una saccatura atlantica verso il Mediterraneo con netto calo barico: "
+                "fase di maltempo organizzato con precipitazioni diffuse, rinforzo della ventilazione e calo termico."
+            )
+        else:
+            return (
+                "Regime depressionario attivo sui bacini italiani con tempo diffusamente instabile o perturbato, "
+                "frequenti occasioni per precipitazioni e ventilazione a tratti vivace."
+            )
+
+
+def generate_cml_day_block(
+    day_str: str,
+    day_idx: int,
+    day_keys: List[str],
+    daily_dict: Dict[str, Any],
+    hours_list: List[Dict[str, Any]],
+    only_rain: bool = False
+) -> str:
+    """Genera il blocco giornaliero in stile CML pulito, rigoroso e privo di emoji decorative."""
+    stats = daily_dict.get(day_str, {})
+    day_hours = [h for h in hours_list if h.get("day") == day_str]
+    if day_hours and "dt" in day_hours[0]:
+        dt = day_hours[0]["dt"]
+        giorno_sett = GIORNI_ITA.get(dt.strftime("%A"), dt.strftime("%A"))
+        mese_nome = MESI_ITA.get(dt.month, dt.strftime("%B"))
+        day_header = f"➡ {giorno_sett} {dt.day} {mese_nome} {dt.year}"
+    else:
+        day_header = f"➡ {day_str}"
+    rain_slots = stats.get("rain_slots", [])
+    tot_mm = stats.get("total_mm_avg", 0.0)
+    max_prob = stats.get("max_prob", 0.0)
+
+    # 1. TEMPO PREVISTO
+    sig_slots = [s for s in rain_slots if s.get("mm", 0.0) >= 0.1 or s.get("prob", 0.0) >= 35.0]
+
+    if sig_slots and (tot_mm >= 0.2 or max_prob >= 35.0):
+        start_h = sig_slots[0]["hour"]
+        end_h = sig_slots[-1]["hour"]
+        time_win = f"attorno alle ore {start_h}" if start_h == end_h else f"tra le {start_h} e le {end_h}"
+        first_hour_val = int(start_h.split(":")[0]) if ":" in start_h else 12
+
+        if first_hour_val < 12:
+            sky_desc = (
+                f"Nuvolosità in aumento già dal mattino con piogge attese {time_win} "
+                f"(accumulo stimato di {tot_mm:.1f} mm, picco di probabilità al {max_prob:.0f}%). "
+                f"Tendenza a graduali schiarite a partire dal tardo pomeriggio."
+            )
+        elif first_hour_val < 18:
+            sky_desc = (
+                f"Al mattino cielo da poco a parzialmente nuvoloso con schiarite. "
+                f"Nel corso del pomeriggio addensamenti cumuliformi più compatti con precipitazioni attese {time_win} "
+                f"(accumulo stimato di {tot_mm:.1f} mm, picco di probabilità al {max_prob:.0f}%). "
+                f"Asciutto o residue velature in serata."
+            )
+        else:
+            sky_desc = (
+                f"Tempo generalmente asciutto e soleggiato per gran parte della giornata. "
+                f"Nel corso della serata e nella notte aumento della copertura nuvolosa con piogge {time_win} "
+                f"(accumulo stimato {tot_mm:.1f} mm, picco di probabilità al {max_prob:.0f}%)."
+            )
+    else:
+        m_codes = [h.get("primary_wmo", 0) for h in day_hours if "06:00" <= h.get("hour", "") < "12:00"]
+        has_fog = any(c in (45, 48) for c in m_codes)
+        max_c = max([h.get("primary_wmo", 0) for h in day_hours]) if day_hours else 0
+
+        if only_rain:
+            sky_desc = "Assenza di precipitazioni significative per l'intera giornata."
+        elif has_fog:
+            sky_desc = (
+                "Possibili banchi di nebbia o foschie dense al primo mattino in rapido dissolvimento. "
+                "Nel corso del pomeriggio cielo sereno o poco nuvoloso, senza fenomeni."
+            )
+        elif max_c <= 1:
+            sky_desc = (
+                "Generalmente sereno o poco nuvoloso su gran parte del territorio, salvo velature in mattinata. "
+                "Nel corso del pomeriggio soleggiato e con rari passaggi nuvolosi, senza fenomeni."
+            )
+        elif max_c == 2:
+            sky_desc = (
+                "Poco nuvoloso ovunque, tranne innocue velature nel pomeriggio sui settori pianeggianti. "
+                "Asciutto per l'intera giornata."
+            )
+        else:
+            sky_desc = (
+                "Cielo irregolarmente nuvoloso con frequenti schiarite, più ampie nelle ore centrali. "
+                "In un contesto generalmente asciutto senza fenomeni di rilievo."
+            )
+
+    # 2. TEMPERATURE
+    temps = stats.get("temps", [])
+    day_min = round(min(temps)) if temps else 15
+    day_max = round(max(temps)) if temps else 25
+
+    if day_hours:
+        min_h = min(day_hours, key=lambda h: h.get("temp", 20.0))
+        max_h = max(day_hours, key=lambda h: h.get("temp", 20.0))
+        min_models = [round(v) for v in min_h.get("model_temps", {}).values() if v is not None]
+        max_models = [round(v) for v in max_h.get("model_temps", {}).values() if v is not None]
+
+        if len(min_models) >= 2 and (max(min_models) - min(min_models)) >= 1:
+            min_str = f"Minime al piano comprese fra {min(min_models)}°C e {max(min_models)}°C"
+        else:
+            min_str = f"Minime al piano attorno a {day_min}°C"
+
+        if len(max_models) >= 2 and (max(max_models) - min(max_models)) >= 1:
+            max_str = f"valori diurni tra {min(max_models)}°C e {max(max_models)}°C"
+        else:
+            max_str = f"valori diurni fino a {day_max}°C"
+    else:
+        min_str = f"Minime al piano attorno a {day_min}°C"
+        max_str = f"valori diurni fino a {day_max}°C"
+
+    trend_str = ""
+    if day_idx > 0:
+        prev_day_key = day_keys[day_idx - 1]
+        prev_stats = daily_dict.get(prev_day_key, {})
+        prev_temps = prev_stats.get("temps", [])
+        if prev_temps and temps:
+            p_max = max(prev_temps)
+            p_min = min(prev_temps)
+            c_max = max(temps)
+            c_min = min(temps)
+            d_max = c_max - p_max
+            d_min = c_min - p_min
+            if d_max >= 1.5 and d_min >= 1.0:
+                trend_str = " (minime e massime in lieve aumento)"
+            elif d_max >= 1.5:
+                trend_str = " (in lieve aumento)"
+            elif d_max <= -1.5 and d_min <= -1.0:
+                trend_str = " (minime e massime in calo)"
+            elif d_max <= -1.5:
+                trend_str = " (in calo)"
+            else:
+                trend_str = " (senza variazioni sostanziali)"
+
+    temp_line = f"Temperature: {min_str}, {max_str}{trend_str}."
+
+    # 3. VENTI
+    w_speeds = stats.get("wind_speeds", [])
+    avg_ws = sum(w_speeds) / len(w_speeds) if w_speeds else 8.0
+    max_ws = max(w_speeds) if w_speeds else 15.0
+
+    m_dirs = [h.get("wind_dir", "") for h in day_hours if "06:00" <= h.get("hour", "") < "12:00" and h.get("wind_dir")]
+    a_dirs = [h.get("wind_dir", "") for h in day_hours if "12:00" <= h.get("hour", "") < "18:00" and h.get("wind_dir")]
+    all_dirs = [h.get("wind_dir", "") for h in day_hours if h.get("wind_dir")]
+
+    dom_card = max(set(all_dirs), key=all_dirs.count) if all_dirs else "E"
+    dom_ita = CARDINAL_TO_ITA_WIND.get(dom_card, "orientali")
+
+    m_dom = max(set(m_dirs), key=m_dirs.count) if m_dirs else dom_card
+    a_dom = max(set(a_dirs), key=a_dirs.count) if a_dirs else dom_card
+    m_ita = CARDINAL_TO_ITA_WIND.get(m_dom, "orientali")
+    a_ita = CARDINAL_TO_ITA_WIND.get(a_dom, "orientali")
+
+    if m_ita != a_ita and len(m_dirs) > 0 and len(a_dirs) > 0 and avg_ws < 22:
+        venti_desc = f"Inizialmente deboli {m_ita}; nel corso del pomeriggio rotazione delle correnti, che si disporranno dai quadranti {a_ita}."
+    elif avg_ws < 8:
+        venti_desc = f"Prevalentemente dai quadranti {dom_ita} a regime di brezza debole, con locali brezze variabili."
+    elif avg_ws < 22:
+        venti_desc = f"Prevalentemente dai quadranti {dom_ita} a regime di brezza, con locali rinforzi nelle ore centrali."
+    else:
+        venti_desc = f"Moderati o sostenuti dai quadranti {dom_ita}, con raffiche fino a {max_ws:.0f} km/h."
+
+    venti_line = f"Venti: {venti_desc}"
+
+    lines = [
+        day_header,
+        f"Tempo previsto: {sky_desc}",
+        temp_line,
+        venti_line
+    ]
+    return "\n".join(lines)
+
+
 def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -> str:
+    """Formatta il bollettino previsioni a 3 giorni in stile sintetico e descrittivo CML, pulito e senza emoji."""
     loc = data["loc"]
     daily = data["daily"]
+    hours = data.get("hours", [])
     updated_at = data.get("updated_at", "")
-    active_m = data.get("active_models", list(MODELS.keys()))
 
-    if "best_match" in active_m:
-        m_head_str = "Modello Singolo Ottimizzato (Best Match)"
-    else:
-        m_head_str = f"{len(active_m)} Modelli: " + ", ".join([MODELS.get(k, k) for k in active_m])
+    syn_text = generate_cml_synoptic_overview(data)
+    day_keys = list(daily.keys())[:3]
 
-    header = [
-        f"📍 <b>PREVISIONI METEO ENSEMBLE (3 GIORNI)</b>",
-        f"🏙️ <b>{loc['name'].upper()}</b>",
-        f"🧭 <i>{loc.get('desc', loc.get('region', ''))}</i>",
-        f"🔬 <i>{m_head_str}</i>",
-        "━━━━━━━━━━━━━━━━━━━━"
+    sections = [
+        f"Analisi sinottica: {syn_text}"
     ]
 
-    body = []
-    for day_str, stats in daily.items():
-        min_t = min(stats["temps"]) if stats["temps"] else 0.0
-        max_t = max(stats["temps"]) if stats["temps"] else 0.0
-        avg_t = sum(stats["temps"]) / len(stats["temps"]) if stats["temps"] else 0.0
-        max_wb = max(stats["wet_bulbs"]) if stats["wet_bulbs"] else 0.0
-        total_mm = stats["total_mm_avg"]
-        max_prob = stats["max_prob"]
-        rain_slots = stats["rain_slots"]
+    for idx, day_str in enumerate(day_keys):
+        block = generate_cml_day_block(day_str, idx, day_keys, daily, hours, only_rain=only_rain)
+        sections.append(block)
 
-        # Indice stress termico
-        stress_label = "🟢 Normale" if max_wb < 24 else "🟡 Attenzione" if max_wb < 28 else "🔴 Stress Elevato"
+    time_only = updated_at.split(" alle ")[-1][:5] if " alle " in updated_at else updated_at
+    footer = f"<i>Bollettino multi-modello per {loc['name']} • Aggiornato alle {time_only}</i>"
+    sections.append(footer)
 
-        day_block = [
-            f"📅 <b>{day_str.upper()}</b>",
-            f"🌡️ <b>Temp:</b> Min <code>{min_t:.1f}°C</code> | Max <code>{max_t:.1f}°C</code> (Med <code>{avg_t:.1f}°C</code>)",
-            f"💧 <b>Bulbo Umido (Tw):</b> Max <code>{max_wb:.1f}°C</code> ({stress_label})",
-            f"🌧️ <b>Pioggia stimata:</b> <code>{total_mm:.2f} mm</code> (Picco prob: <code>{max_prob:.0f}%</code>)"
-        ]
-
-        # Dettaglio modelli
-        if "best_match" in stats["model_totals"]:
-            model_str = f"Best Match: <code>{stats['model_totals']['best_match']:.1f}mm</code>"
-        else:
-            model_str = " • ".join([f"{MODELS[k]}: <code>{stats['model_totals'][k]:.1f}mm</code>" for k in active_m if k in stats["model_totals"]])
-        day_block.append(f"   ↳ <i>Modelli:</i> {model_str}")
-
-        # Finestre di pioggia
-        if rain_slots:
-            r_lines = []
-            for slot in rain_slots[:6]:
-                r_lines.append(f"<code>{slot['hour']}</code> {slot['icon']} {slot['mm']:.1f}mm ({slot['prob']:.0f}%)")
-            slot_str = " | ".join(r_lines)
-            if len(rain_slots) > 6:
-                slot_str += f" (+ altre {len(rain_slots)-6}h)"
-            day_block.append(f"   ↳ 🌧️ <b>Ore pioggia:</b> {slot_str}")
-        else:
-            if not only_rain:
-                day_block.append("   ↳ ☀️ <i>Nessuna pioggia significativa prevista.</i>")
-
-        body.append("\n".join(day_block))
-
-    footer = [
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 <i>Aggiornato alle {updated_at} • {data.get('source_label', 'Dati Open-Meteo')}</i>"
-    ]
-
-    return "\n\n".join(["\n".join(header), "\n\n".join(body), "\n".join(footer)])
+    return "\n\n".join(sections)
 
 
 def format_single_city_synoptic_message(data: Dict[str, Any], city_label: str) -> str:
@@ -1386,6 +1581,7 @@ class TelegramBotClient:
     def set_commands(self) -> None:
         commands = [
             {"command": "start", "description": "Apri il menu meteo principale"},
+            {"command": "previsioni", "description": "Bollettino previsioni a 3 giorni"},
             {"command": "adesso", "description": "Temperatura e meteo in tempo reale"},
             {"command": "sole", "description": "Alba, tramonto e crepuscolo civile di oggi"},
             {"command": "putignano", "description": "Previsioni 3 giorni per Putignano"},
@@ -1588,6 +1784,11 @@ class WeatherBotRunner:
             cur_loc = self.get_user_loc(chat_id)
             self.user_current_tab[chat_id] = "now"
             self.send_view(chat_id, cur_loc, "now", force_refresh=True)
+
+        elif low_text in ("/previsioni", "previsioni", "/previsione", "previsione", "/bollettino", "bollettino", "/forecast", "forecast", "/3gg", "3gg"):
+            cur_loc = self.get_user_loc(chat_id)
+            self.user_current_tab[chat_id] = "forecast"
+            self.send_view(chat_id, cur_loc, "forecast")
 
         elif low_text in ("/putignano", "putignano"):
             self.user_current_location[chat_id] = DEFAULT_LOCATIONS["putignano"]
