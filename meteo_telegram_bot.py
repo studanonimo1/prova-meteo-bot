@@ -1007,9 +1007,9 @@ def generate_cml_day_block(
     max_prob = stats.get("max_prob", 0.0)
 
     # 1. TEMPO PREVISTO
-    sig_slots = [s for s in rain_slots if s.get("mm", 0.0) >= 0.1 or s.get("prob", 0.0) >= 35.0]
+    sig_slots = [s for s in rain_slots if s.get("mm", 0.0) >= 0.05 or s.get("prob", 0.0) >= 25.0]
 
-    if sig_slots and (tot_mm >= 0.2 or max_prob >= 35.0):
+    if sig_slots and (tot_mm >= 0.1 or max_prob >= 25.0):
         start_h = sig_slots[0]["hour"]
         end_h = sig_slots[-1]["hour"]
         time_win = f"attorno alle ore {start_h}" if start_h == end_h else f"tra le {start_h} e le {end_h}"
@@ -1166,8 +1166,12 @@ def format_city_weather_message(data: Dict[str, Any], only_rain: bool = False) -
         block = generate_cml_day_block(day_str, idx, day_keys, daily, hours, only_rain=only_rain)
         sections.append(block)
 
+    active_m = data.get("active_models", [])
+    model_count = len(active_m) if active_m and "best_match" not in active_m else 1
+    model_spec = f"media {model_count} modelli" if model_count > 1 else "modello singolo"
+
     time_only = updated_at.split(" alle ")[-1][:5] if " alle " in updated_at else updated_at
-    footer = f"<i>Bollettino multi-modello per {loc['name']} • Aggiornato alle {time_only}</i>"
+    footer = f"<i>Bollettino {model_spec} per {loc['name']} • Aggiornato alle {time_only}</i>"
     sections.append(footer)
 
     return "\n\n".join(sections)
